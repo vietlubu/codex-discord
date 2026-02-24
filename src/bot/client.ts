@@ -52,8 +52,9 @@ export class DiscordBot {
   }
 
   async start(): Promise<void> {
-    await this.registerSlashCommands();
+    // Login first so client.application.id is available for command registration
     await this.client.login(this.config.discord.token);
+    await this.registerSlashCommands();
   }
 
   async stop(): Promise<void> {
@@ -221,17 +222,20 @@ export class DiscordBot {
 
     const rest = new REST({ version: "10" }).setToken(this.config.discord.token);
 
+    const appId = this.client.application?.id;
+    if (!appId) {
+      logger.error("Cannot register slash commands: client.application.id is unavailable (login first)");
+      return;
+    }
+
     try {
       await rest.put(
-        Routes.applicationGuildCommands(
-          this.client.application?.id ?? (await this.client.login(this.config.discord.token)).split(".")[0]!,
-          this.config.discord.guildId,
-        ),
+        Routes.applicationGuildCommands(appId, this.config.discord.guildId),
         { body: commands.map((c) => c.toJSON()) },
       );
       logger.info("Slash commands registered");
     } catch (error) {
-      logger.error("Failed to register slash commands", { error });
+      logger.error("Failed to register slash commands", { error: serializeError(error) });
     }
   }
 
@@ -711,4 +715,20 @@ export class DiscordBot {
       await interaction.editReply(`❌ Sync failed: ${errorMsg}`);
     }
   }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+/** Serialize an Error into a plain object that Winston can log properly. */
+function serializeError(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return {
+      message: err.message,
+      name: err.name,
+      stack: err.stack,
+      ...(err as any).code ? { code: (err as any).code } : {},
+      ...(err as any).status ? { status: (err as any).status } : {},
+    };
+  }
+  return { message: String(err) };
 }

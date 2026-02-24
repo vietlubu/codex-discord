@@ -30,6 +30,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  logger.error("Fatal error", { error });
+  const msg = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  logger.error("Fatal error", { message: msg, stack });
   process.exit(1);
 });

@@ -19,11 +19,57 @@ npm install
 
 # 2. Configure
 cp .env.example .env
-# Edit .env with your Discord token, Guild ID, and OpenAI API key
+# Edit .env with your Discord token, Guild ID, etc.
 
 # 3. Run
 npm run dev
 ```
+
+## Discord Bot Setup
+
+### 1. Create Bot Application
+
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Click **New Application** → name it (e.g. "Codex Bot") → Create
+3. Go to **Bot** tab → click **Reset Token** → copy the token → save as `DISCORD_TOKEN` in `.env`
+
+### 2. Enable Privileged Intents
+
+Still in the **Bot** tab, scroll down to **Privileged Gateway Intents** and enable:
+
+- ✅ **MESSAGE CONTENT INTENT** (required — bot reads message text)
+- ✅ **SERVER MEMBERS INTENT** (optional)
+
+Click **Save Changes**.
+
+### 3. Invite Bot to Server
+
+Go to **OAuth2** → **URL Generator**:
+
+**Scopes:**
+- ✅ `bot`
+- ✅ `applications.commands`
+
+**Bot Permissions:**
+- ✅ Manage Channels
+- ✅ Send Messages
+- ✅ Manage Threads
+- ✅ Read Message History
+- ✅ Use Slash Commands
+
+Copy the generated URL → open in browser → select your server → **Authorize**.
+
+Or use this URL directly (replace `YOUR_CLIENT_ID` with your Application ID):
+
+```
+https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=397553205248&scope=bot%20applications.commands
+```
+
+### 4. Get Guild ID
+
+1. In Discord, go to **Settings → Advanced → Developer Mode** → enable
+2. Right-click your server name → **Copy Server ID**
+3. Save as `DISCORD_GUILD_ID` in `.env`
 
 ## Slash Commands
 
@@ -46,15 +92,16 @@ npm run dev
 
 ## Environment Variables
 
-```bash
-DISCORD_TOKEN=       # Discord bot token
-DISCORD_GUILD_ID=    # Discord server ID
-OPENAI_API_KEY=      # OpenAI API key
-CODEX_MODEL=         # Default model (default: o4-mini)
-CODEX_APPROVAL_MODE= # never | on-request | on-failure | untrusted
-CODEX_SANDBOX_MODE=  # read-only | workspace-write | danger-full-access
-DATABASE_PATH=       # SQLite database path (default: ./data/codex-discord.db)
-```
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DISCORD_TOKEN` | ✅ | — | Discord bot token |
+| `DISCORD_GUILD_ID` | ✅ | — | Discord server ID |
+| `OPENAI_API_KEY` | ❌ | — | Not needed if logged in via Codex App |
+| `CODEX_MODEL` | ❌ | `o4-mini` | Default Codex model |
+| `CODEX_APPROVAL_MODE` | ❌ | `on-failure` | `never` \| `on-request` \| `on-failure` \| `untrusted` |
+| `CODEX_SANDBOX_MODE` | ❌ | `workspace-write` | `read-only` \| `workspace-write` \| `danger-full-access` |
+| `VERBOSE_LEVEL` | ❌ | `1` | `0` = quiet (final only), `1` = normal, `2` = detailed |
+| `DATABASE_PATH` | ❌ | `./data/codex-discord.db` | SQLite database path |
 
 ## Tech Stack
 
