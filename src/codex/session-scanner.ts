@@ -59,7 +59,7 @@ const ARCHIVED_DIR = join(CODEX_HOME, "archived_sessions");
  * Scan all Codex sessions from disk (~/.codex/sessions/ and ~/.codex/archived_sessions/).
  * Returns sessions grouped by their working directory (cwd = project path).
  */
-export function scanAllSessions(): Map<string, CodexSession[]> {
+export function scanAllSessions(includeArchived: boolean = false): Map<string, CodexSession[]> {
   const sessions = new Map<string, CodexSession[]>();
 
   // Scan active sessions
@@ -73,14 +73,16 @@ export function scanAllSessions(): Map<string, CodexSession[]> {
     }
   }
 
-  // Scan archived sessions
-  const archivedFiles = findJsonlFiles(ARCHIVED_DIR);
-  for (const filePath of archivedFiles) {
-    const session = parseSessionMeta(filePath);
-    if (session) {
-      const list = sessions.get(session.cwd) ?? [];
-      list.push(session);
-      sessions.set(session.cwd, list);
+  // Scan archived sessions (only if enabled)
+  if (includeArchived) {
+    const archivedFiles = findJsonlFiles(ARCHIVED_DIR);
+    for (const filePath of archivedFiles) {
+      const session = parseSessionMeta(filePath);
+      if (session) {
+        const list = sessions.get(session.cwd) ?? [];
+        list.push(session);
+        sessions.set(session.cwd, list);
+      }
     }
   }
 
@@ -100,8 +102,8 @@ export function scanAllSessions(): Map<string, CodexSession[]> {
 /**
  * Get all sessions for a specific project directory.
  */
-export function getSessionsForProject(projectPath: string): CodexSession[] {
-  const allSessions = scanAllSessions();
+export function getSessionsForProject(projectPath: string, includeArchived: boolean = false): CodexSession[] {
+  const allSessions = scanAllSessions(includeArchived);
   return allSessions.get(projectPath) ?? [];
 }
 
@@ -215,9 +217,49 @@ export function getSessionDisplayName(session: CodexSession): string {
   return session.id.slice(0, 12);
 }
 
+/**
+ * Get a human-readable title for a session by extracting the first user prompt.
+ * Truncates to fit Discord thread name limit (100 chars).
+ * Falls back to timestamp-based name if no user message found.
+ */
+export function getSessionTitle(session: CodexSession): string {
+  try {
+    const content = readFileSync(session.filePath, "utf-8");
+    const lines = content.split("\n");
+
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (
+          parsed.type === "response_item" &&
+          parsed.payload?.role === "user" &&
+          parsed.payload?.type === "message"
+        ) {
+          const texts = (parsed.payload.content ?? [])
+            .filter((c: any) => c.type === "input_text" && c.text)
+            .map((c: any) => c.text)
+            .join(" ");
+          if (texts) {
+            // Clean up and truncate for Discord thread name (max 100 chars)
+            const clean = texts.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+            return clean.length > 95 ? clean.slice(0, 92) + "..." : clean;
+          }
+        }
+      } catch {
+        // skip
+      }
+    }
+  } catch {
+    // File not readable
+  }
+
+  // Fallback to timestamp
+  return getSessionDisplayName(session);
+}
+
 // ─── Internal Helpers ────────────────────────────────────────────────
 
-function parseSessionMeta(filePath: string): CodexSession | null {
+export function parseSessionMeta(filePath: string): CodexSession | null {
   try {
     const content = readFileSync(filePath, "utf-8");
     const firstLine = content.split("\n")[0];

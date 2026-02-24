@@ -84,8 +84,8 @@ export const ProjectRepo = {
        VALUES (?, ?, ?, ?, ?)`,
       [channelId, projectPath, projectName, model ?? null, approvalMode ?? null],
     );
-    const id = lastInsertRowId();
-    return this.getById(id)!;
+    // Use getByChannelId instead of lastInsertRowId (unreliable with sql.js save cycle)
+    return this.getByChannelId(channelId)!;
   },
 
   getById(id: number): ProjectRow | undefined {
@@ -127,8 +127,8 @@ export const ThreadRepo = {
        VALUES (?, ?, ?, ?)`,
       [discordThreadId, codexThreadId ?? null, projectId, threadName],
     );
-    const id = lastInsertRowId();
-    return this.getById(id)!;
+    // Use getByDiscordThreadId instead of lastInsertRowId
+    return this.getByDiscordThreadId(discordThreadId)!;
   },
 
   getById(id: number): ThreadRow | undefined {
@@ -166,6 +166,13 @@ export const ThreadRepo = {
   delete(id: number): void {
     execute("DELETE FROM messages WHERE thread_id = ?", [id]);
     execute("DELETE FROM threads WHERE id = ?", [id]);
+  },
+
+  getByCodexThreadId(codexThreadId: string): ThreadRow | undefined {
+    return queryOne<ThreadRow>(
+      "SELECT * FROM threads WHERE codex_thread_id = ?",
+      [codexThreadId],
+    );
   },
 };
 

@@ -22,7 +22,10 @@ import {
   getSessionsForProject,
   parseSessionMessages,
   getSessionDisplayName,
+  getSessionTitle,
+  type CodexSession,
 } from "../codex/session-scanner.js";
+import { SessionWatcher } from "../codex/session-watcher.js";
 import { logger } from "../utils/logger.js";
 import { COLORS, CATEGORY_PREFIX, STATUS_EMOJI, DISCORD_MSG_LIMIT, splitMessage } from "../utils/constants.js";
 
@@ -34,11 +37,24 @@ export class DiscordBot {
   private config: Config;
   private codexService: CodexService;
   private messageSync: MessageSync;
+  private sessionWatcher: SessionWatcher;
+  /** Per-project lock to prevent concurrent handleNewSession from creating duplicate channels */
+  private syncLocks = new Map<string, Promise<void>>();
 
   constructor(config: Config) {
     this.config = config;
     this.codexService = new CodexService(config.codex);
     this.messageSync = new MessageSync(this.codexService, config.codex.verboseLevel);
+    this.sessionWatcher = new SessionWatcher(
+      (session) =>
+        this.handleNewSession(session).catch((err) =>
+          logger.error("Auto-sync error", { error: serializeError(err) }),
+        ),
+      (session, newLines) =>
+        this.handleSessionUpdate(session, newLines).catch((err) =>
+          logger.error("Auto-sync update error", { error: serializeError(err) }),
+        ),
+    );
 
     this.client = new Client({
       intents: [
@@ -55,11 +71,232 @@ export class DiscordBot {
     // Login first so client.application.id is available for command registration
     await this.client.login(this.config.discord.token);
     await this.registerSlashCommands();
+    this.startSessionWatcher();
   }
 
   async stop(): Promise<void> {
+    this.sessionWatcher.stop();
     this.client.destroy();
     logger.info("Discord bot stopped");
+  }
+
+  // ─── Auto-Sync Watcher ─────────────────────────────────────────────
+
+  private startSessionWatcher(): void {
+    // Mark all existing session files as seen so watcher only fires for new ones
+    const existing = scanAllSessions(this.config.codex.syncArchived);
+    for (const sessions of existing.values()) {
+      for (const s of sessions) {
+        this.sessionWatcher.markSeen(s.filePath);
+      }
+    }
+    this.sessionWatcher.start();
+  }
+
+  /**
+   * Called by SessionWatcher when a new Codex session file appears.
+   * Auto-creates the project channel (if needed) and a thread for the session.
+   */
+  private async handleNewSession(session: {
+    id: string;
+    cwd: string;
+    timestamp: string;
+    model: string | undefined;
+    filePath: string;
+  }): Promise<void> {
+    // Serialize per-project to prevent duplicate channel creation
+    const projectPath = session.cwd;
+    const prev = this.syncLocks.get(projectPath) ?? Promise.resolve();
+    const current = prev.then(() => this._handleNewSessionImpl(session));
+    this.syncLocks.set(projectPath, current.catch(() => {}));
+    await current;
+  }
+
+  private async _handleNewSessionImpl(session: {
+    id: string;
+    cwd: string;
+    timestamp: string;
+    model: string | undefined;
+    filePath: string;
+  }): Promise<void> {
+    const guild = this.client.guilds.cache.first();
+    if (!guild) return;
+
+    const projectPath = session.cwd;
+    if (!existsSync(projectPath)) return;
+
+    const projectName = basename(projectPath);
+
+    // Find or create project
+    let project = ProjectRepo.getAll().find((p) => p.project_path === projectPath);
+    let projectChannel: any = null; // Keep reference to avoid cache miss
+
+    if (project) {
+      // Project exists in DB — verify channel still exists on Discord
+      try {
+        projectChannel = await guild.channels.fetch(project.channel_id);
+      } catch {
+        // Channel was deleted — clean up stale DB entry
+        logger.info("Auto-sync: stale project detected, recreating channel", {
+          projectName,
+          oldChannelId: project.channel_id,
+        });
+        ProjectRepo.delete(project.id);
+        project = undefined as any;
+      }
+    }
+
+    if (!project) {
+      // Auto-create channel for new project
+      projectChannel = await guild.channels.create({
+        name: projectName.toLowerCase().replace(/[^a-z0-9-]/g, "-"),
+        type: ChannelType.GuildText,
+        topic: `${CATEGORY_PREFIX} Codex project: ${projectPath}`,
+      });
+
+      project = ProjectRepo.create(
+        projectChannel.id,
+        projectPath,
+        projectName,
+        session.model,
+      );
+
+      if (!project) {
+        logger.error("Auto-sync: ProjectRepo.create returned undefined");
+        return;
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.PRIMARY)
+        .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
+        .setDescription(
+          `📁 **Path:** \`${projectPath}\`\n` +
+            `🤖 **Model:** ${session.model ?? this.config.codex.model}\n\n` +
+            `Auto-synced from new Codex session.`,
+        )
+        .setTimestamp();
+      await projectChannel.send({ embeds: [embed] });
+
+      logger.info("Auto-sync: created project channel", { projectName });
+    }
+
+    // Get channel reference (reuse if we just created/fetched it)
+    if (!projectChannel) return;
+
+    // Check if thread for this session already exists (avoid UNIQUE constraint)
+    const existingThread = ThreadRepo.getByCodexThreadId(session.id);
+    if (existingThread) return;
+
+    const threadName = getSessionTitle(session);
+    try {
+      const discordThread = await projectChannel.threads.create({
+        name: threadName,
+        autoArchiveDuration: 10080,
+      });
+
+      // handleThreadCreate event may have already created the DB row
+      // (race condition: Discord emits ThreadCreate before we reach here)
+      const alreadyMapped = ThreadRepo.getByDiscordThreadId(discordThread.id);
+      if (alreadyMapped) {
+        // Just link the codex session ID
+        if (!alreadyMapped.codex_thread_id) {
+          ThreadRepo.updateCodexThreadId(discordThread.id, session.id);
+        }
+      } else {
+        ThreadRepo.create(discordThread.id, project.id, threadName, session.id);
+      }
+
+      const threadEmbed = new EmbedBuilder()
+        .setColor(COLORS.INFO)
+        .setDescription(
+          `🔗 Codex session \`${session.id.slice(0, 12)}...\`\n` +
+            `📅 ${session.timestamp}\n` +
+            `🤖 ${session.model ?? "default"}\n\n` +
+            `Use \`/sync-messages\` to replay this session.`,
+        )
+        .setTimestamp();
+      await discordThread.send({ embeds: [threadEmbed] });
+
+      logger.info("Auto-sync: created thread for session", {
+        project: projectName,
+        threadName,
+        session: session.id.slice(0, 12),
+      });
+    } catch (err) {
+      logger.warn("Auto-sync: failed to create thread", {
+        error: serializeError(err),
+      });
+    }
+  }
+
+  /**
+   * Called when new lines are appended to an existing session file.
+   * Parses the new JSONL lines for user/assistant messages and sends
+   * them to the corresponding Discord thread in real-time.
+   */
+  private async handleSessionUpdate(
+    session: { id: string; cwd: string },
+    newLines: string[],
+  ): Promise<void> {
+    // Find the Discord thread linked to this session
+    const threadRow = ThreadRepo.getByCodexThreadId(session.id);
+    if (!threadRow) return;
+
+    const guild = this.client.guilds.cache.first();
+    if (!guild) return;
+
+    // Fetch the Discord thread channel
+    let discordThread;
+    try {
+      discordThread = await guild.channels.fetch(threadRow.discord_thread_id);
+    } catch {
+      return; // Thread may have been deleted
+    }
+    if (!discordThread || !discordThread.isTextBased()) return;
+
+    const channel = discordThread as any;
+
+    for (const line of newLines) {
+      try {
+        const parsed = JSON.parse(line);
+
+        // Skip non-message events
+        if (parsed.type !== "response_item") continue;
+
+        const role = parsed.payload?.role;
+        const payloadType = parsed.payload?.type;
+
+        // User message
+        if (role === "user" && payloadType === "message") {
+          const texts = (parsed.payload.content ?? [])
+            .filter((c: any) => c.type === "input_text" && c.text)
+            .map((c: any) => c.text)
+            .join("\n");
+          if (texts) {
+            const chunks = splitMessage(`👤 **User:**\n${texts}`);
+            for (const chunk of chunks) {
+              await channel.send({ content: chunk }).catch(() => {});
+            }
+          }
+        }
+
+        // Assistant message
+        if (role === "assistant" && payloadType === "message") {
+          const texts = (parsed.payload.content ?? [])
+            .filter((c: any) => c.type === "output_text" && c.text)
+            .map((c: any) => c.text)
+            .join("\n");
+          if (texts) {
+            const chunks = splitMessage(`🤖 **Codex:**\n${texts}`);
+            for (const chunk of chunks) {
+              await channel.send({ content: chunk }).catch(() => {});
+            }
+          }
+        }
+      } catch {
+        // Skip unparseable lines
+      }
+    }
   }
 
   // ─── Event Handlers ─────────────────────────────────────────────────
@@ -457,7 +694,7 @@ export class DiscordBot {
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      const sessionsByProject = scanAllSessions();
+      const sessionsByProject = scanAllSessions(this.config.codex.syncArchived);
 
       if (sessionsByProject.size === 0) {
         await interaction.editReply(
@@ -611,7 +848,7 @@ export class DiscordBot {
 
     if (requestedSessionId) {
       // User specified a session ID
-      const sessions = getSessionsForProject(project.project_path);
+      const sessions = getSessionsForProject(project.project_path, this.config.codex.syncArchived);
       const match = sessions.find((s) => s.id === requestedSessionId);
       if (!match) {
         await interaction.editReply(
@@ -622,7 +859,7 @@ export class DiscordBot {
       sessionFilePath = match.filePath;
     } else if (threadRow.codex_thread_id) {
       // Use the session linked to this thread
-      const sessions = getSessionsForProject(project.project_path);
+      const sessions = getSessionsForProject(project.project_path, this.config.codex.syncArchived);
       const match = sessions.find((s) => s.id === threadRow.codex_thread_id);
       if (match) {
         sessionFilePath = match.filePath;
@@ -643,7 +880,7 @@ export class DiscordBot {
       }
     } else {
       // No session linked — list available sessions
-      const sessions = getSessionsForProject(project.project_path);
+      const sessions = getSessionsForProject(project.project_path, this.config.codex.syncArchived);
       if (sessions.length === 0) {
         await interaction.editReply(
           "❌ No Codex sessions found for this project.",

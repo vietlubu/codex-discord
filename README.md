@@ -101,6 +101,7 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=39
 | `CODEX_APPROVAL_MODE` | ❌ | `on-failure` | `never` \| `on-request` \| `on-failure` \| `untrusted` |
 | `CODEX_SANDBOX_MODE` | ❌ | `workspace-write` | `read-only` \| `workspace-write` \| `danger-full-access` |
 | `VERBOSE_LEVEL` | ❌ | `1` | `0` = quiet (final only), `1` = normal, `2` = detailed |
+| `SYNC_ARCHIVED` | ❌ | `false` | Include archived Codex sessions in sync (`true`/`false`) |
 | `DATABASE_PATH` | ❌ | `./data/codex-discord.db` | SQLite database path |
 
 ## Tech Stack

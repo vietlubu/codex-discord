@@ -18,6 +18,7 @@ export interface Config {
     approvalMode: "never" | "on-request" | "on-failure" | "untrusted";
     sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
     verboseLevel: VerboseLevel;
+    syncArchived: boolean;
   };
   database: {
     path: string;
@@ -53,6 +54,7 @@ export function loadConfig(): Config {
         (process.env.CODEX_SANDBOX_MODE as Config["codex"]["sandboxMode"]) ??
         "workspace-write",
       verboseLevel: parseVerboseLevel(process.env.VERBOSE_LEVEL),
+      syncArchived: process.env.SYNC_ARCHIVED === "true",
     },
     database: {
       path: process.env.DATABASE_PATH ?? "./data/codex-discord.db",
