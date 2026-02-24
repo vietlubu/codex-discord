@@ -1,0 +1,35 @@
+{
+  "name": "codex-discord",
+  "version": "0.1.0",
+  "description": "Discord bot for monitoring and interacting with OpenAI Codex",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "codex",
+    "discord",
+    "bot",
+    "ai"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@openai/codex": "latest",
+    "@openai/codex-sdk": "latest",
+    "sql.js": "^1.11.0",
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.0",
+    "winston": "^3.14.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}
