@@ -1,5 +1,6 @@
 import type { SendableChannels, Message } from "discord.js";
 import type { ThreadEvent } from "@openai/codex-sdk";
+import type { VerboseLevel } from "../config/index.js";
 import { CodexService } from "../codex/service.js";
 import { EventFormatter, type FormattedMessage } from "../codex/event-formatter.js";
 import { ThreadRepo, ProjectRepo, MessageRepo } from "../storage/repositories.js";
@@ -16,9 +17,9 @@ export class MessageSync {
   /** Track which discord threads are currently processing a Codex turn */
   private processing = new Set<string>();
 
-  constructor(codexService: CodexService) {
+  constructor(codexService: CodexService, verboseLevel: VerboseLevel = 1) {
     this.codexService = codexService;
-    this.formatter = new EventFormatter();
+    this.formatter = new EventFormatter(verboseLevel);
   }
 
   /**
@@ -114,8 +115,6 @@ export class MessageSync {
       const formatted = this.formatter.formatEvent(event as ThreadEvent);
       if (!formatted) continue;
 
-      await this.sendFormatted(channel, formatted, transientMessage, threadRow.id);
-
       // Track transient messages for replacement
       if (formatted.isTransient) {
         if (!transientMessage) {
@@ -132,6 +131,7 @@ export class MessageSync {
         transientMessage = null;
       }
 
+      // Send the main message
       const sent = await this.sendNew(channel, formatted);
       if (sent) {
         MessageRepo.create(
@@ -142,22 +142,19 @@ export class MessageSync {
           (event as any).type,
         );
       }
+
+      // Send extra chunks from message splitting
+      if (formatted.extraChunks) {
+        for (const chunk of formatted.extraChunks) {
+          await this.sendNew(channel, { content: chunk });
+        }
+      }
     }
 
     // Clean up remaining transient message
     if (transientMessage) {
       await transientMessage.delete().catch(() => {});
     }
-  }
-
-  private async sendFormatted(
-    _channel: SendableChannels,
-    _formatted: FormattedMessage,
-    _transient: Message | null,
-    _threadId: number,
-  ): Promise<void> {
-    // This is handled directly in streamCodexResponse
-    // Method kept for potential future abstraction
   }
 
   private async sendNew(

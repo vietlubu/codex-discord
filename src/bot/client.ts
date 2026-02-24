@@ -24,7 +24,7 @@ import {
   getSessionDisplayName,
 } from "../codex/session-scanner.js";
 import { logger } from "../utils/logger.js";
-import { COLORS, CATEGORY_PREFIX, STATUS_EMOJI, DISCORD_MSG_LIMIT } from "../utils/constants.js";
+import { COLORS, CATEGORY_PREFIX, STATUS_EMOJI, DISCORD_MSG_LIMIT, splitMessage } from "../utils/constants.js";
 
 /**
  * Discord bot client — handles events, slash commands, and bridges to Codex.
@@ -38,7 +38,7 @@ export class DiscordBot {
   constructor(config: Config) {
     this.config = config;
     this.codexService = new CodexService(config.codex);
-    this.messageSync = new MessageSync(this.codexService);
+    this.messageSync = new MessageSync(this.codexService, config.codex.verboseLevel);
 
     this.client = new Client({
       intents: [
@@ -682,14 +682,13 @@ export class DiscordBot {
 
       for (const msg of userMessages) {
         const prefix = msg.role === "user" ? "👤 **User:**" : "🤖 **Codex:**";
-        let content = `${prefix}\n${msg.text}`;
+        const fullContent = `${prefix}\n${msg.text}`;
 
-        // Truncate + split long messages
-        if (content.length > DISCORD_MSG_LIMIT) {
-          content = content.slice(0, DISCORD_MSG_LIMIT - 20) + "\n\n*[truncated]*";
+        // Split long messages into chunks
+        const chunks = splitMessage(fullContent);
+        for (const chunk of chunks) {
+          await thread.send({ content: chunk }).catch(() => {});
         }
-
-        await thread.send({ content }).catch(() => {});
         sent++;
 
         // Rate limit: don't flood
