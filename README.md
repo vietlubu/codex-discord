@@ -34,6 +34,8 @@ npm run dev
 | `/threads` | List threads in current project channel |
 | `/status` | Show bot status and statistics |
 | `/remove-project` | Remove a project and its channel |
+| `/sync-projects` | Scan local Codex sessions and create channels/threads |
+| `/sync-messages` | Replay messages from a Codex session into current thread |
 
 ## How It Works
 
