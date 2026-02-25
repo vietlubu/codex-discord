@@ -122,27 +122,44 @@ export class DiscordBot {
     const guild = this.client.guilds.cache.first();
     if (!guild) return;
 
-    const projectPath = session.cwd;
+    // Normalize path to prevent mismatches (trailing slash, symlinks, etc.)
+    const { resolve } = await import("node:path");
+    const projectPath = resolve(session.cwd);
     if (!existsSync(projectPath)) return;
 
     const projectName = basename(projectPath);
 
     // Find or create project
-    let project = ProjectRepo.getAll().find((p) => p.project_path === projectPath);
+    let project = ProjectRepo.getAll().find((p) => resolve(p.project_path) === projectPath);
     let projectChannel: any = null; // Keep reference to avoid cache miss
 
     if (project) {
       // Project exists in DB — verify channel still exists on Discord
       try {
         projectChannel = await guild.channels.fetch(project.channel_id);
-      } catch {
-        // Channel was deleted — clean up stale DB entry
-        logger.info("Auto-sync: stale project detected, recreating channel", {
+        logger.debug("Auto-sync: found existing channel", {
           projectName,
-          oldChannelId: project.channel_id,
+          channelId: project.channel_id,
         });
-        ProjectRepo.delete(project.id);
-        project = undefined as any;
+      } catch (err: any) {
+        // Only treat "Unknown Channel" (10003) or "Missing Access" (50001) as stale
+        const code = err?.code;
+        if (code === 10003 || code === 50001) {
+          logger.info("Auto-sync: stale project detected, recreating channel", {
+            projectName,
+            oldChannelId: project.channel_id,
+            errorCode: code,
+          });
+          ProjectRepo.delete(project.id);
+          project = undefined as any;
+        } else {
+          // Transient error (rate limit, network) — skip, don't recreate
+          logger.warn("Auto-sync: channel fetch failed (transient), skipping", {
+            projectName,
+            error: serializeError(err),
+          });
+          return;
+        }
       }
     }
 
