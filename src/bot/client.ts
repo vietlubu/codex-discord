@@ -28,6 +28,7 @@ import {
 import { SessionWatcher } from "../codex/session-watcher.js";
 import { logger } from "../utils/logger.js";
 import { COLORS, CATEGORY_PREFIX, STATUS_EMOJI, DISCORD_MSG_LIMIT, splitMessage } from "../utils/constants.js";
+import { canonicalizeProjectPath } from "../utils/path.js";
 
 /**
  * Discord bot client — handles events, slash commands, and bridges to Codex.
@@ -104,12 +105,20 @@ export class DiscordBot {
     model: string | undefined;
     filePath: string;
   }): Promise<void> {
-    // Serialize per-project to prevent duplicate channel creation
-    const projectPath = session.cwd;
+    // Serialize by canonical project path to prevent duplicate channel/thread creation.
+    const projectPath = canonicalizeProjectPath(session.cwd);
     const prev = this.syncLocks.get(projectPath) ?? Promise.resolve();
-    const current = prev.then(() => this._handleNewSessionImpl(session));
-    this.syncLocks.set(projectPath, current.catch(() => {}));
-    await current;
+    const current = prev.then(() => this._handleNewSessionImpl(session, projectPath));
+    const guarded = current.catch(() => {});
+    this.syncLocks.set(projectPath, guarded);
+
+    try {
+      await current;
+    } finally {
+      if (this.syncLocks.get(projectPath) === guarded) {
+        this.syncLocks.delete(projectPath);
+      }
+    }
   }
 
   private async _handleNewSessionImpl(session: {
@@ -118,19 +127,16 @@ export class DiscordBot {
     timestamp: string;
     model: string | undefined;
     filePath: string;
-  }): Promise<void> {
+  }, projectPath: string): Promise<void> {
     const guild = this.client.guilds.cache.first();
     if (!guild) return;
 
-    // Normalize path to prevent mismatches (trailing slash, symlinks, etc.)
-    const { resolve } = await import("node:path");
-    const projectPath = resolve(session.cwd);
     if (!existsSync(projectPath)) return;
 
     const projectName = basename(projectPath);
 
     // Find or create project
-    let project = ProjectRepo.getAll().find((p) => resolve(p.project_path) === projectPath);
+    let project = this.findProjectByPath(projectPath);
     let projectChannel: any = null; // Keep reference to avoid cache miss
 
     if (project) {
@@ -164,6 +170,8 @@ export class DiscordBot {
     }
 
     if (!project) {
+      let createdProjectChannel = true;
+
       // Auto-create channel for new project
       projectChannel = await guild.channels.create({
         name: projectName.toLowerCase().replace(/[^a-z0-9-]/g, "-"),
@@ -183,18 +191,37 @@ export class DiscordBot {
         return;
       }
 
-      const embed = new EmbedBuilder()
-        .setColor(COLORS.PRIMARY)
-        .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
-        .setDescription(
-          `📁 **Path:** \`${projectPath}\`\n` +
-            `🤖 **Model:** ${session.model ?? this.config.codex.model}\n\n` +
-            `Auto-synced from new Codex session.`,
-        )
-        .setTimestamp();
-      await projectChannel.send({ embeds: [embed] });
+      // Another worker/process may have inserted the canonical project first.
+      // If so, delete the extra channel we just created and reuse the existing mapping.
+      if (project.channel_id !== projectChannel.id) {
+        createdProjectChannel = false;
+        await projectChannel
+          .delete("Duplicate project channel prevented")
+          .catch(() => {});
+        projectChannel = await guild.channels.fetch(project.channel_id).catch(() => null);
+        if (!projectChannel) {
+          logger.warn("Auto-sync: existing mapped channel not accessible", {
+            mappedChannelId: project.channel_id,
+            projectPath,
+          });
+          return;
+        }
+      }
 
-      logger.info("Auto-sync: created project channel", { projectName });
+      if (createdProjectChannel) {
+        const embed = new EmbedBuilder()
+          .setColor(COLORS.PRIMARY)
+          .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
+          .setDescription(
+            `📁 **Path:** \`${projectPath}\`\n` +
+              `🤖 **Model:** ${session.model ?? this.config.codex.model}\n\n` +
+              `Auto-synced from new Codex session.`,
+          )
+          .setTimestamp();
+        await projectChannel.send({ embeds: [embed] });
+
+        logger.info("Auto-sync: created project channel", { projectName });
+      }
     }
 
     // Get channel reference (reuse if we just created/fetched it)
@@ -210,6 +237,14 @@ export class DiscordBot {
         name: threadName,
         autoArchiveDuration: 10080,
       });
+
+      const mappedThread = ThreadRepo.getByCodexThreadId(session.id);
+      if (mappedThread && mappedThread.discord_thread_id !== discordThread.id) {
+        await discordThread
+          .delete("Duplicate Codex session thread prevented")
+          .catch(() => {});
+        return;
+      }
 
       // handleThreadCreate event may have already created the DB row
       // (race condition: Discord emits ThreadCreate before we reach here)
@@ -244,6 +279,24 @@ export class DiscordBot {
         error: serializeError(err),
       });
     }
+  }
+
+  private findProjectByPath(projectPath: string) {
+    const byPath = ProjectRepo.getByProjectPath(projectPath);
+    if (byPath) return byPath;
+
+    const all = ProjectRepo.getAll();
+    for (const project of all) {
+      if (canonicalizeProjectPath(project.project_path) === projectPath) {
+        if (project.project_path !== projectPath) {
+          ProjectRepo.updateProjectPath(project.id, projectPath);
+          return { ...project, project_path: projectPath };
+        }
+        return project;
+      }
+    }
+
+    return undefined;
   }
 
   /**
@@ -526,22 +579,21 @@ export class DiscordBot {
   private async handleSetup(interaction: any): Promise<void> {
     await interaction.deferReply({ ephemeral: true });
 
-    const projectPath = interaction.options.getString("project_path", true);
+    const requestedPath = interaction.options.getString("project_path", true);
     const customName = interaction.options.getString("name");
     const model = interaction.options.getString("model");
+    const projectPath = canonicalizeProjectPath(requestedPath);
 
     // Validate path
     if (!existsSync(projectPath)) {
-      await interaction.editReply(`❌ Path does not exist: \`${projectPath}\``);
+      await interaction.editReply(`❌ Path does not exist: \`${requestedPath}\``);
       return;
     }
 
     const projectName = customName ?? basename(projectPath);
 
     // Check if already registered
-    const existing = ProjectRepo.getAll().find(
-      (p) => p.project_path === projectPath,
-    );
+    const existing = this.findProjectByPath(projectPath);
     if (existing) {
       await interaction.editReply(
         `⚠️ Project already registered as **${existing.project_name}** in <#${existing.channel_id}>`,
@@ -559,7 +611,20 @@ export class DiscordBot {
       });
 
       // Save mapping
-      ProjectRepo.create(channel.id, projectPath, projectName, model ?? undefined);
+      const project = ProjectRepo.create(
+        channel.id,
+        projectPath,
+        projectName,
+        model ?? undefined,
+      );
+
+      if (project.channel_id !== channel.id) {
+        await channel.delete("Duplicate project channel prevented").catch(() => {});
+        await interaction.editReply(
+          `⚠️ Project already registered as **${project.project_name}** in <#${project.channel_id}>`,
+        );
+        return;
+      }
 
       // Send welcome embed in the new channel
       const embed = new EmbedBuilder()
@@ -726,45 +791,51 @@ export class DiscordBot {
       const details: string[] = [];
 
       for (const [projectPath, sessions] of sessionsByProject) {
+        const canonicalProjectPath = canonicalizeProjectPath(projectPath);
+
         // Skip if project already registered
-        const existing = ProjectRepo.getAll().find(
-          (p) => p.project_path === projectPath,
-        );
+        const existing = this.findProjectByPath(canonicalProjectPath);
         if (existing) {
           skipped++;
           continue;
         }
 
         // Skip if path doesn't exist
-        if (!existsSync(projectPath)) {
+        if (!existsSync(canonicalProjectPath)) {
           skipped++;
           continue;
         }
 
-        const projectName = basename(projectPath);
+        const projectName = basename(canonicalProjectPath);
         const model = sessions[0]?.model;
 
         // Create channel
         const channel = await guild.channels.create({
           name: projectName.toLowerCase().replace(/[^a-z0-9-]/g, "-"),
           type: ChannelType.GuildText,
-          topic: `${CATEGORY_PREFIX} Codex project: ${projectPath}`,
+          topic: `${CATEGORY_PREFIX} Codex project: ${canonicalProjectPath}`,
         });
 
         // Save to DB
         const projectRow = ProjectRepo.create(
           channel.id,
-          projectPath,
+          canonicalProjectPath,
           projectName,
           model,
         );
+
+        if (projectRow.channel_id !== channel.id) {
+          await channel.delete("Duplicate project channel prevented").catch(() => {});
+          skipped++;
+          continue;
+        }
 
         // Send welcome embed
         const embed = new EmbedBuilder()
           .setColor(COLORS.PRIMARY)
           .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
           .setDescription(
-            `📁 **Path:** \`${projectPath}\`\n` +
+            `📁 **Path:** \`${canonicalProjectPath}\`\n` +
               `🤖 **Model:** ${model ?? this.config.codex.model}\n` +
               `📊 **Sessions found:** ${sessions.length}\n\n` +
               `Synced from local Codex sessions.`,
@@ -773,7 +844,15 @@ export class DiscordBot {
         await channel.send({ embeds: [embed] });
 
         // Create a Discord thread for each Codex session
+        const seenSessionIds = new Set<string>();
         for (const session of sessions) {
+          if (seenSessionIds.has(session.id)) continue;
+          seenSessionIds.add(session.id);
+
+          if (ThreadRepo.getByCodexThreadId(session.id)) {
+            continue;
+          }
+
           const threadName = getSessionDisplayName(session);
           try {
             const discordThread = await channel.threads.create({
@@ -781,12 +860,19 @@ export class DiscordBot {
               autoArchiveDuration: 10080, // 7 days
             });
 
-            ThreadRepo.create(
+            const threadRow = ThreadRepo.create(
               discordThread.id,
               projectRow.id,
               threadName,
               session.id,
             );
+
+            if (threadRow.discord_thread_id !== discordThread.id) {
+              await discordThread
+                .delete("Duplicate Codex session thread prevented")
+                .catch(() => {});
+              continue;
+            }
 
             // Send info embed in thread
             const threadEmbed = new EmbedBuilder()

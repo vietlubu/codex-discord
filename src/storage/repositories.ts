@@ -62,11 +62,11 @@ function execute(sql: string, params: any[] = []): void {
   saveDatabase();
 }
 
-/** Get the last inserted row id */
-function lastInsertRowId(): number {
-  const db = getDatabase();
-  const result = queryOne<{ id: number }>("SELECT last_insert_rowid() as id");
-  return result?.id ?? 0;
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.toLowerCase().includes("unique constraint failed")
+  );
 }
 
 // ─── Project Repository ──────────────────────────────────────────────
@@ -79,11 +79,21 @@ export const ProjectRepo = {
     model?: string,
     approvalMode?: string,
   ): ProjectRow {
-    execute(
-      `INSERT INTO projects (channel_id, project_path, project_name, model, approval_mode)
-       VALUES (?, ?, ?, ?, ?)`,
-      [channelId, projectPath, projectName, model ?? null, approvalMode ?? null],
-    );
+    try {
+      execute(
+        `INSERT INTO projects (channel_id, project_path, project_name, model, approval_mode)
+         VALUES (?, ?, ?, ?, ?)`,
+        [channelId, projectPath, projectName, model ?? null, approvalMode ?? null],
+      );
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        const existing =
+          this.getByProjectPath(projectPath) ?? this.getByChannelId(channelId);
+        if (existing) return existing;
+      }
+      throw error;
+    }
+
     // Use getByChannelId instead of lastInsertRowId (unreliable with sql.js save cycle)
     return this.getByChannelId(channelId)!;
   },
@@ -96,8 +106,16 @@ export const ProjectRepo = {
     return queryOne<ProjectRow>("SELECT * FROM projects WHERE channel_id = ?", [channelId]);
   },
 
+  getByProjectPath(projectPath: string): ProjectRow | undefined {
+    return queryOne<ProjectRow>("SELECT * FROM projects WHERE project_path = ?", [projectPath]);
+  },
+
   getAll(): ProjectRow[] {
     return queryAll<ProjectRow>("SELECT * FROM projects ORDER BY created_at DESC");
+  },
+
+  updateProjectPath(id: number, projectPath: string): void {
+    execute("UPDATE projects SET project_path = ? WHERE id = ?", [projectPath, id]);
   },
 
   delete(id: number): void {
@@ -122,11 +140,22 @@ export const ThreadRepo = {
     threadName: string,
     codexThreadId?: string,
   ): ThreadRow {
-    execute(
-      `INSERT INTO threads (discord_thread_id, codex_thread_id, project_id, thread_name)
-       VALUES (?, ?, ?, ?)`,
-      [discordThreadId, codexThreadId ?? null, projectId, threadName],
-    );
+    try {
+      execute(
+        `INSERT INTO threads (discord_thread_id, codex_thread_id, project_id, thread_name)
+         VALUES (?, ?, ?, ?)`,
+        [discordThreadId, codexThreadId ?? null, projectId, threadName],
+      );
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        const existing =
+          this.getByDiscordThreadId(discordThreadId) ??
+          (codexThreadId ? this.getByCodexThreadId(codexThreadId) : undefined);
+        if (existing) return existing;
+      }
+      throw error;
+    }
+
     // Use getByDiscordThreadId instead of lastInsertRowId
     return this.getByDiscordThreadId(discordThreadId)!;
   },
@@ -150,10 +179,16 @@ export const ThreadRepo = {
   },
 
   updateCodexThreadId(discordThreadId: string, codexThreadId: string): void {
-    execute(
-      "UPDATE threads SET codex_thread_id = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_thread_id = ?",
-      [codexThreadId, discordThreadId],
-    );
+    try {
+      execute(
+        "UPDATE threads SET codex_thread_id = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_thread_id = ?",
+        [codexThreadId, discordThreadId],
+      );
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) {
+        throw error;
+      }
+    }
   },
 
   updateStatus(discordThreadId: string, status: string): void {

@@ -2,6 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { logger } from "../utils/logger.js";
+import { canonicalizeProjectPath } from "../utils/path.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -104,7 +105,7 @@ export function scanAllSessions(includeArchived: boolean = false): Map<string, C
  */
 export function getSessionsForProject(projectPath: string, includeArchived: boolean = false): CodexSession[] {
   const allSessions = scanAllSessions(includeArchived);
-  return allSessions.get(projectPath) ?? [];
+  return allSessions.get(canonicalizeProjectPath(projectPath)) ?? [];
 }
 
 /**
@@ -286,7 +287,7 @@ export function parseSessionMeta(filePath: string): CodexSession | null {
 
     return {
       id: parsed.payload.id,
-      cwd: parsed.payload.cwd,
+      cwd: canonicalizeProjectPath(parsed.payload.cwd),
       timestamp: parsed.payload.timestamp,
       model,
       filePath,
