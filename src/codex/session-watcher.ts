@@ -114,9 +114,9 @@ export class SessionWatcher {
       const session = parseSessionMeta(filePath);
       if (!session) return;
 
-      // Record current size as the offset
-      const size = statSync(filePath).size;
-      this.fileOffsets.set(filePath, size);
+      // Start at 0 so we can replay the file's current content once
+      // (messages can already exist by the time the new-file event arrives).
+      this.fileOffsets.set(filePath, 0);
       this.sessionCache.set(filePath, session);
 
       logger.info("New Codex session detected", {
@@ -125,6 +125,10 @@ export class SessionWatcher {
       });
 
       this.onNewSession(session);
+
+      // Emit the file's current lines immediately.
+      // The consumer may buffer these until thread mapping is ready.
+      this.processUpdate(filePath);
     } else {
       // Existing file modified — read only new bytes
       this.processUpdate(filePath);

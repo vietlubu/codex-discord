@@ -41,6 +41,9 @@ export class DiscordBot {
   private sessionWatcher: SessionWatcher;
   /** Per-project lock to prevent concurrent handleNewSession from creating duplicate channels */
   private syncLocks = new Map<string, Promise<void>>();
+  /** Buffer session updates while the Discord thread mapping is not ready yet. */
+  private pendingSessionLines = new Map<string, string[]>();
+  private static readonly MAX_BUFFERED_SESSION_LINES = 2000;
 
   constructor(config: Config) {
     this.config = config;
@@ -77,6 +80,7 @@ export class DiscordBot {
 
   async stop(): Promise<void> {
     this.sessionWatcher.stop();
+    this.pendingSessionLines.clear();
     this.client.destroy();
     logger.info("Discord bot stopped");
   }
@@ -229,7 +233,10 @@ export class DiscordBot {
 
     // Check if thread for this session already exists (avoid UNIQUE constraint)
     const existingThread = ThreadRepo.getByCodexThreadId(session.id);
-    if (existingThread) return;
+    if (existingThread) {
+      await this.flushBufferedSessionLines(session.id, session.cwd);
+      return;
+    }
 
     const threadName = getSessionTitle(session);
     try {
@@ -268,6 +275,7 @@ export class DiscordBot {
         )
         .setTimestamp();
       await discordThread.send({ embeds: [threadEmbed] });
+      await this.flushBufferedSessionLines(session.id, session.cwd);
 
       logger.info("Auto-sync: created thread for session", {
         project: projectName,
@@ -310,7 +318,10 @@ export class DiscordBot {
   ): Promise<void> {
     // Find the Discord thread linked to this session
     const threadRow = ThreadRepo.getByCodexThreadId(session.id);
-    if (!threadRow) return;
+    if (!threadRow) {
+      this.bufferSessionLines(session.id, newLines);
+      return;
+    }
 
     const guild = this.client.guilds.cache.first();
     if (!guild) return;
@@ -367,6 +378,39 @@ export class DiscordBot {
         // Skip unparseable lines
       }
     }
+  }
+
+  private bufferSessionLines(sessionId: string, lines: string[]): void {
+    if (lines.length === 0) return;
+
+    const queued = this.pendingSessionLines.get(sessionId) ?? [];
+    queued.push(...lines);
+
+    const overflow = queued.length - DiscordBot.MAX_BUFFERED_SESSION_LINES;
+    if (overflow > 0) {
+      queued.splice(0, overflow);
+    }
+
+    this.pendingSessionLines.set(sessionId, queued);
+
+    logger.debug("Buffered session updates while waiting for thread mapping", {
+      session: sessionId.slice(0, 12),
+      bufferedLines: queued.length,
+    });
+  }
+
+  private async flushBufferedSessionLines(sessionId: string, cwd: string): Promise<void> {
+    const buffered = this.pendingSessionLines.get(sessionId);
+    if (!buffered || buffered.length === 0) return;
+
+    this.pendingSessionLines.delete(sessionId);
+
+    logger.debug("Flushing buffered session updates", {
+      session: sessionId.slice(0, 12),
+      lines: buffered.length,
+    });
+
+    await this.handleSessionUpdate({ id: sessionId, cwd }, buffered);
   }
 
   // ─── Event Handlers ─────────────────────────────────────────────────
