@@ -384,12 +384,30 @@ export class DiscordBot {
         for (const rawUserText of extractUserTextsFromSessionEvent(parsed)) {
           const visibleText = extractVisibleUserMessage(rawUserText);
           if (!visibleText) continue;
+          if (
+            this.messageSync.shouldSuppressSessionEcho(
+              threadRow.discord_thread_id,
+              "user",
+              visibleText,
+            )
+          ) {
+            continue;
+          }
           if (sentUserBatch.has(visibleText)) continue;
           sentUserBatch.add(visibleText);
           await sendChunked("👤 **User:**", visibleText, "user");
         }
 
         for (const assistantText of extractAssistantTextsFromSessionEvent(parsed)) {
+          if (
+            this.messageSync.shouldSuppressSessionEcho(
+              threadRow.discord_thread_id,
+              "assistant",
+              assistantText,
+            )
+          ) {
+            continue;
+          }
           await sendAssistant(assistantText);
         }
       } catch {
