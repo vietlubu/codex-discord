@@ -1,4 +1,4 @@
-import { watch, existsSync, statSync, readFileSync, type FSWatcher } from "node:fs";
+import { watch, existsSync, statSync, openSync, readSync, closeSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { parseSessionMeta, type CodexSession } from "./session-scanner.js";
@@ -151,10 +151,10 @@ export class SessionWatcher {
     // Read only new bytes
     let newContent: string;
     try {
-      const fd = require("node:fs").openSync(filePath, "r");
+      const fd = openSync(filePath, "r");
       const buffer = Buffer.alloc(currentSize - prevOffset);
-      require("node:fs").readSync(fd, buffer, 0, buffer.length, prevOffset);
-      require("node:fs").closeSync(fd);
+      readSync(fd, buffer, 0, buffer.length, prevOffset);
+      closeSync(fd);
       newContent = buffer.toString("utf-8");
     } catch {
       return;
