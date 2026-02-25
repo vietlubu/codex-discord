@@ -50,6 +50,13 @@ interface TurnContext {
   };
 }
 
+const INTERNAL_CONTEXT_TAGS = [
+  "environment_context",
+  "app-context",
+  "collaboration_mode",
+  "permissions instructions",
+];
+
 // ─── Scanner ─────────────────────────────────────────────────────────
 
 const CODEX_HOME = join(homedir(), ".codex");
@@ -114,6 +121,8 @@ export function getSessionsForProject(projectPath: string, includeArchived: bool
  */
 export function parseSessionMessages(filePath: string): CodexSessionMessage[] {
   const messages: CodexSessionMessage[] = [];
+  let lastUserText: string | undefined;
+  let lastAssistantText: string | undefined;
 
   try {
     const content = readFileSync(filePath, "utf-8");
@@ -122,49 +131,38 @@ export function parseSessionMessages(filePath: string): CodexSessionMessage[] {
     for (const line of lines) {
       try {
         const parsed = JSON.parse(line);
+        const timestamp =
+          typeof parsed.timestamp === "string" ? parsed.timestamp : "";
+
+        for (const rawUserText of extractUserTextsFromSessionEvent(parsed)) {
+          const visibleText = extractVisibleUserMessage(rawUserText);
+          if (!visibleText) continue;
+          if (visibleText === lastUserText) continue;
+
+          messages.push({
+            timestamp,
+            role: "user",
+            type: "text",
+            text: visibleText,
+          });
+          lastUserText = visibleText;
+        }
+
+        for (const assistantText of extractAssistantTextsFromSessionEvent(parsed)) {
+          if (assistantText === lastAssistantText) continue;
+
+          messages.push({
+            timestamp,
+            role: "assistant",
+            type: "text",
+            text: assistantText,
+          });
+          lastAssistantText = assistantText;
+        }
 
         if (parsed.type === "response_item") {
           const item = parsed as ResponseItem;
-          const role = item.payload.role;
-          const payloadType = item.payload.type;
-
-          // Skip developer/system messages
-          if (role === "developer") continue;
-
-          // Extract user messages
-          if (role === "user" && payloadType === "message") {
-            const texts = (item.payload.content ?? [])
-              .filter((c) => c.type === "input_text" && c.text)
-              .map((c) => c.text!)
-              .join("\n");
-            if (texts) {
-              messages.push({
-                timestamp: item.timestamp,
-                role: "user",
-                type: "text",
-                text: texts,
-              });
-            }
-          }
-
-          // Extract assistant messages (final answers and commentary)
-          if (role === "assistant" && payloadType === "message") {
-            const texts = (item.payload.content ?? [])
-              .filter((c) => c.type === "output_text" && c.text)
-              .map((c) => c.text!)
-              .join("\n");
-            if (texts) {
-              messages.push({
-                timestamp: item.timestamp,
-                role: "assistant",
-                type: "text",
-                text: texts,
-              });
-            }
-          }
-
-          // Extract reasoning summaries
-          if (payloadType === "reasoning") {
+          if (item.payload.type === "reasoning") {
             const summaries = (item.payload as any).summary;
             if (Array.isArray(summaries)) {
               const text = summaries
@@ -181,16 +179,6 @@ export function parseSessionMessages(filePath: string): CodexSessionMessage[] {
               }
             }
           }
-        }
-
-        // Extract event messages (agent_message type for commentary)
-        if (parsed.type === "event_msg" && parsed.payload?.type === "agent_message") {
-          messages.push({
-            timestamp: parsed.timestamp,
-            role: "assistant",
-            type: "text",
-            text: parsed.payload.message,
-          });
         }
       } catch {
         // Skip unparseable lines
@@ -231,20 +219,16 @@ export function getSessionTitle(session: CodexSession): string {
     for (const line of lines) {
       try {
         const parsed = JSON.parse(line);
-        if (
-          parsed.type === "response_item" &&
-          parsed.payload?.role === "user" &&
-          parsed.payload?.type === "message"
-        ) {
-          const texts = (parsed.payload.content ?? [])
-            .filter((c: any) => c.type === "input_text" && c.text)
-            .map((c: any) => c.text)
-            .join(" ");
-          if (texts) {
-            // Clean up and truncate for Discord thread name (max 100 chars)
-            const clean = texts.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-            return clean.length > 95 ? clean.slice(0, 92) + "..." : clean;
-          }
+        for (const rawUserText of extractUserTextsFromSessionEvent(parsed)) {
+          const visibleText = extractVisibleUserMessage(rawUserText);
+          if (!visibleText) continue;
+
+          // Clean up and truncate for Discord thread name (max 100 chars)
+          const clean = visibleText
+            .replace(/\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          return clean.length > 95 ? clean.slice(0, 92) + "..." : clean;
         }
       } catch {
         // skip
@@ -256,6 +240,130 @@ export function getSessionTitle(session: CodexSession): string {
 
   // Fallback to timestamp
   return getSessionDisplayName(session);
+}
+
+export function extractVisibleUserMessage(text: string): string | null {
+  const normalized = text.replace(/\r\n?/g, "\n").trim();
+  if (!normalized) return null;
+
+  if (isAgentsInstructionsMessage(normalized)) return null;
+  if (isInternalContextMessage(normalized)) return null;
+
+  return normalized;
+}
+
+export function extractUserTextsFromSessionEvent(parsed: any): string[] {
+  const texts: string[] = [];
+
+  if (
+    parsed?.type === "response_item" &&
+    parsed.payload?.role === "user" &&
+    parsed.payload?.type === "message"
+  ) {
+    for (const item of parsed.payload.content ?? []) {
+      if (item?.type !== "input_text") continue;
+      const text = coerceText(item?.text ?? item?.value ?? item?.message);
+      if (text) texts.push(text);
+    }
+  }
+
+  if (parsed?.type === "event_msg" && parsed.payload?.type === "user_message") {
+    const direct = coerceText(parsed.payload?.message);
+    if (direct) texts.push(direct);
+
+    if (Array.isArray(parsed.payload?.text_elements)) {
+      for (const item of parsed.payload.text_elements) {
+        const text = coerceText(item?.text ?? item?.value ?? item);
+        if (text) texts.push(text);
+      }
+    }
+  }
+
+  return uniqueTexts(texts);
+}
+
+export function extractAssistantTextsFromSessionEvent(parsed: any): string[] {
+  const texts: string[] = [];
+
+  if (
+    parsed?.type === "response_item" &&
+    parsed.payload?.role === "assistant" &&
+    parsed.payload?.type === "message"
+  ) {
+    for (const item of parsed.payload.content ?? []) {
+      if (item?.type !== "output_text" && item?.type !== "text") continue;
+      const text = coerceText(item?.text ?? item?.value ?? item?.message);
+      if (text) texts.push(text);
+    }
+  }
+
+  if (parsed?.type === "event_msg" && parsed.payload?.type === "agent_message") {
+    const direct = coerceText(parsed.payload?.message);
+    if (direct) texts.push(direct);
+
+    if (Array.isArray(parsed.payload?.text_elements)) {
+      for (const item of parsed.payload.text_elements) {
+        const text = coerceText(item?.text ?? item?.value ?? item);
+        if (text) texts.push(text);
+      }
+    }
+  }
+
+  if (parsed?.type === "event_msg" && parsed.payload?.type === "task_complete") {
+    const finalMessage = coerceText(parsed.payload?.last_agent_message);
+    if (finalMessage) texts.push(finalMessage);
+  }
+
+  return uniqueTexts(texts);
+}
+
+function isAgentsInstructionsMessage(text: string): boolean {
+  const openTag = "<INSTRUCTIONS>";
+  const closeTag = "</INSTRUCTIONS>";
+  const openIndex = text.indexOf(openTag);
+  const closeIndex = text.lastIndexOf(closeTag);
+  if (openIndex === -1 || closeIndex === -1 || closeIndex <= openIndex) {
+    return false;
+  }
+
+  const header = text.slice(0, openIndex).trim();
+  const tail = text.slice(closeIndex + closeTag.length).trim();
+  if (tail.length > 0) return false;
+
+  const headerLines = header
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (headerLines.length !== 1) return false;
+
+  return /^#?\s*AGENTS\.md instructions for\s+/i.test(headerLines[0]);
+}
+
+function isInternalContextMessage(text: string): boolean {
+  return INTERNAL_CONTEXT_TAGS.some((tag) => {
+    const openTag = `<${tag}>`;
+    const closeTag = `</${tag}>`;
+    return text.startsWith(openTag) && text.endsWith(closeTag);
+  });
+}
+
+function coerceText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.replace(/\r\n?/g, "\n").trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function uniqueTexts(texts: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+
+  for (const text of texts) {
+    if (seen.has(text)) continue;
+    seen.add(text);
+    unique.push(text);
+  }
+
+  return unique;
 }
 
 // ─── Internal Helpers ────────────────────────────────────────────────

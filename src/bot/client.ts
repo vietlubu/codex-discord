@@ -23,6 +23,9 @@ import {
   parseSessionMessages,
   getSessionDisplayName,
   getSessionTitle,
+  extractAssistantTextsFromSessionEvent,
+  extractVisibleUserMessage,
+  extractUserTextsFromSessionEvent,
   type CodexSession,
 } from "../codex/session-scanner.js";
 import { SessionWatcher } from "../codex/session-watcher.js";
@@ -336,47 +339,71 @@ export class DiscordBot {
     if (!discordThread || !discordThread.isTextBased()) return;
 
     const channel = discordThread as any;
+    const sentAssistantBatch = new Set<string>();
+    const sentUserBatch = new Set<string>();
+    let sendFailures = 0;
+    let extractedAssistant = 0;
+    let sentAssistant = 0;
+
+    const sendChunked = async (
+      prefix: string,
+      text: string,
+      role: "user" | "assistant",
+    ): Promise<boolean> => {
+      const chunks = splitMessage(`${prefix}\n${text}`);
+      for (const chunk of chunks) {
+        try {
+          await channel.send({ content: chunk });
+        } catch (error) {
+          sendFailures++;
+          logger.warn("Auto-sync: failed to send message chunk", {
+            session: session.id.slice(0, 12),
+            discordThreadId: threadRow.discord_thread_id,
+            role,
+            error: serializeError(error),
+          });
+          return false;
+        }
+      }
+      return true;
+    };
 
     for (const line of newLines) {
       try {
         const parsed = JSON.parse(line);
-
-        // Skip non-message events
-        if (parsed.type !== "response_item") continue;
-
-        const role = parsed.payload?.role;
-        const payloadType = parsed.payload?.type;
-
-        // User message
-        if (role === "user" && payloadType === "message") {
-          const texts = (parsed.payload.content ?? [])
-            .filter((c: any) => c.type === "input_text" && c.text)
-            .map((c: any) => c.text)
-            .join("\n");
-          if (texts) {
-            const chunks = splitMessage(`👤 **User:**\n${texts}`);
-            for (const chunk of chunks) {
-              await channel.send({ content: chunk }).catch(() => {});
-            }
-          }
+        const sendAssistant = async (text: string) => {
+          const normalized = String(text).trim();
+          if (!normalized) return;
+          // Some Codex log formats emit both response_item assistant text and event_msg agent_message.
+          if (sentAssistantBatch.has(normalized)) return;
+          sentAssistantBatch.add(normalized);
+          extractedAssistant++;
+          const ok = await sendChunked("🤖 **Codex:**", normalized, "assistant");
+          if (ok) sentAssistant++;
+        };
+        for (const rawUserText of extractUserTextsFromSessionEvent(parsed)) {
+          const visibleText = extractVisibleUserMessage(rawUserText);
+          if (!visibleText) continue;
+          if (sentUserBatch.has(visibleText)) continue;
+          sentUserBatch.add(visibleText);
+          await sendChunked("👤 **User:**", visibleText, "user");
         }
 
-        // Assistant message
-        if (role === "assistant" && payloadType === "message") {
-          const texts = (parsed.payload.content ?? [])
-            .filter((c: any) => c.type === "output_text" && c.text)
-            .map((c: any) => c.text)
-            .join("\n");
-          if (texts) {
-            const chunks = splitMessage(`🤖 **Codex:**\n${texts}`);
-            for (const chunk of chunks) {
-              await channel.send({ content: chunk }).catch(() => {});
-            }
-          }
+        for (const assistantText of extractAssistantTextsFromSessionEvent(parsed)) {
+          await sendAssistant(assistantText);
         }
       } catch {
         // Skip unparseable lines
       }
+    }
+
+    if (extractedAssistant > 0 && sentAssistant === 0) {
+      logger.warn("Auto-sync: extracted assistant messages but none were sent", {
+        session: session.id.slice(0, 12),
+        discordThreadId: threadRow.discord_thread_id,
+        extractedAssistant,
+        sendFailures,
+      });
     }
   }
 
@@ -1050,32 +1077,49 @@ export class DiscordBot {
     // Parse and send messages
     try {
       const messages = parseSessionMessages(sessionFilePath!);
-      const userMessages = messages.filter(
+      const replayMessages = messages.filter(
         (m) => m.role === "user" || (m.role === "assistant" && m.type === "text"),
       );
 
-      if (userMessages.length === 0) {
+      if (replayMessages.length === 0) {
         await interaction.editReply(
           "No chat messages found in this session.",
         );
         return;
       }
 
+      const userCount = replayMessages.filter((m) => m.role === "user").length;
+      const assistantCount = replayMessages.filter(
+        (m) => m.role === "assistant" && m.type === "text",
+      ).length;
+
       await interaction.editReply(
-        `${STATUS_EMOJI.WORKING} Syncing **${userMessages.length}** messages...`,
+        `${STATUS_EMOJI.WORKING} Syncing **${replayMessages.length}** messages ` +
+          `(user: ${userCount}, codex: ${assistantCount})...`,
       );
 
       const thread = interaction.channel;
       let sent = 0;
+      let failed = 0;
 
-      for (const msg of userMessages) {
+      for (const msg of replayMessages) {
         const prefix = msg.role === "user" ? "👤 **User:**" : "🤖 **Codex:**";
         const fullContent = `${prefix}\n${msg.text}`;
 
         // Split long messages into chunks
         const chunks = splitMessage(fullContent);
         for (const chunk of chunks) {
-          await thread.send({ content: chunk }).catch(() => {});
+          try {
+            await thread.send({ content: chunk });
+          } catch (error) {
+            failed++;
+            logger.warn("Sync messages: failed to send replay chunk", {
+              threadId: discordThreadId,
+              role: msg.role,
+              error: serializeError(error),
+            });
+            break;
+          }
         }
         sent++;
 
@@ -1088,12 +1132,19 @@ export class DiscordBot {
       const doneEmbed = new EmbedBuilder()
         .setColor(COLORS.SUCCESS)
         .setDescription(
-          `${STATUS_EMOJI.DONE} Synced **${sent}** messages from Codex session.`,
+          `${STATUS_EMOJI.DONE} Synced **${sent}** messages from Codex session.` +
+            (failed > 0 ? `\n⚠️ Failed chunks: **${failed}**` : ""),
         )
         .setTimestamp();
       await thread.send({ embeds: [doneEmbed] });
 
-      logger.info("Sync messages complete", { sent, threadId: discordThreadId });
+      logger.info("Sync messages complete", {
+        sent,
+        failed,
+        userCount,
+        assistantCount,
+        threadId: discordThreadId,
+      });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`❌ Sync failed: ${errorMsg}`);

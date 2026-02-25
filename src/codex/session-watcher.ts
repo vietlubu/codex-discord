@@ -5,6 +5,8 @@ import { parseSessionMeta, type CodexSession } from "./session-scanner.js";
 import { logger } from "../utils/logger.js";
 
 const SESSIONS_DIR = join(homedir(), ".codex", "sessions");
+const FOLLOW_UP_POLL_INTERVAL_MS = 3_000;
+const FOLLOW_UP_WINDOW_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /** A new session file appeared */
 export type NewSessionHandler = (session: CodexSession) => void;
@@ -30,9 +32,15 @@ export class SessionWatcher {
 
   /** Debounce timers per file path */
   private pending = new Map<string, NodeJS.Timeout>();
+  /** Fallback polling timers to cover missed fs.watch append events. */
+  private followUpPollers = new Map<string, NodeJS.Timeout>();
+  /** Polling deadline per file path (epoch ms). */
+  private followUpDeadlines = new Map<string, number>();
 
   /** Parsed session meta cache (avoid re-parsing first line) */
   private sessionCache = new Map<string, CodexSession>();
+  /** Trailing partial line per file (when read chunk ends mid-JSON line). */
+  private partialLines = new Map<string, string>();
 
   constructor(onNewSession: NewSessionHandler, onSessionUpdate: SessionUpdateHandler) {
     this.onNewSession = onNewSession;
@@ -47,8 +55,10 @@ export class SessionWatcher {
     try {
       const size = statSync(filePath).size;
       this.fileOffsets.set(filePath, size);
+      this.partialLines.delete(filePath);
     } catch {
       this.fileOffsets.set(filePath, 0);
+      this.partialLines.delete(filePath);
     }
   }
 
@@ -84,6 +94,12 @@ export class SessionWatcher {
       clearTimeout(timeout);
     }
     this.pending.clear();
+    for (const timeout of this.followUpPollers.values()) {
+      clearTimeout(timeout);
+    }
+    this.followUpPollers.clear();
+    this.followUpDeadlines.clear();
+    this.partialLines.clear();
     logger.info("Session watcher stopped");
   }
 
@@ -129,9 +145,11 @@ export class SessionWatcher {
       // Emit the file's current lines immediately.
       // The consumer may buffer these until thread mapping is ready.
       this.processUpdate(filePath);
+      this.extendFollowUpPolling(filePath);
     } else {
       // Existing file modified — read only new bytes
       this.processUpdate(filePath);
+      this.extendFollowUpPolling(filePath);
     }
   }
 
@@ -146,7 +164,15 @@ export class SessionWatcher {
     }
 
     // No new data
-    if (currentSize <= prevOffset) return;
+    if (currentSize <= prevOffset) {
+      // File was truncated or rewritten: reset state and replay from start.
+      if (currentSize < prevOffset) {
+        this.fileOffsets.set(filePath, 0);
+        this.partialLines.delete(filePath);
+        this.processUpdate(filePath);
+      }
+      return;
+    }
 
     // Read only new bytes
     let newContent: string;
@@ -163,8 +189,32 @@ export class SessionWatcher {
     // Update offset
     this.fileOffsets.set(filePath, currentSize);
 
-    // Parse new lines
-    const newLines = newContent.split("\n").filter((l) => l.trim());
+    // Parse new lines while preserving a trailing partial line for next update.
+    const previousPartial = this.partialLines.get(filePath) ?? "";
+    const combined = previousPartial + newContent;
+    const parts = combined.split("\n");
+
+    let trailingPartial = "";
+    if (!combined.endsWith("\n")) {
+      trailingPartial = parts.pop() ?? "";
+    }
+
+    if (trailingPartial) {
+      // Some writers do not end the last JSONL record with '\n'.
+      // If the trailing chunk is already valid JSON, emit it now.
+      try {
+        JSON.parse(trailingPartial);
+        parts.push(trailingPartial);
+        trailingPartial = "";
+      } catch {
+        // Keep incomplete line for the next append.
+      }
+    }
+
+    if (trailingPartial) this.partialLines.set(filePath, trailingPartial);
+    else this.partialLines.delete(filePath);
+
+    const newLines = parts.filter((l) => l.trim());
     if (newLines.length === 0) return;
 
     // Get cached session meta (or re-parse if needed)
@@ -181,5 +231,34 @@ export class SessionWatcher {
     });
 
     this.onSessionUpdate(session, newLines);
+
+    // Keep a short tail-polling window for this file because fs.watch may
+    // miss some append events on macOS in burst writes.
+    this.extendFollowUpPolling(filePath);
+  }
+
+  private extendFollowUpPolling(filePath: string): void {
+    const until = Date.now() + FOLLOW_UP_WINDOW_MS;
+    const existingDeadline = this.followUpDeadlines.get(filePath) ?? 0;
+    this.followUpDeadlines.set(filePath, Math.max(existingDeadline, until));
+
+    if (this.followUpPollers.has(filePath)) return;
+
+    const tick = () => {
+      const deadline = this.followUpDeadlines.get(filePath) ?? 0;
+      if (Date.now() > deadline || !existsSync(filePath)) {
+        this.followUpDeadlines.delete(filePath);
+        this.followUpPollers.delete(filePath);
+        return;
+      }
+
+      this.processUpdate(filePath);
+
+      const timer = setTimeout(tick, FOLLOW_UP_POLL_INTERVAL_MS);
+      this.followUpPollers.set(filePath, timer);
+    };
+
+    const timer = setTimeout(tick, FOLLOW_UP_POLL_INTERVAL_MS);
+    this.followUpPollers.set(filePath, timer);
   }
 }
