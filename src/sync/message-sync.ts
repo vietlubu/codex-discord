@@ -1,10 +1,15 @@
 import type { SendableChannels, Message } from "discord.js";
-import type { ThreadEvent } from "@openai/codex-sdk";
+import type { ThreadEvent, Input, UserInput } from "@openai/codex-sdk";
 import type { VerboseLevel } from "../config/index.js";
 import { CodexService } from "../codex/service.js";
 import { EventFormatter, type FormattedMessage } from "../codex/event-formatter.js";
 import { ThreadRepo, ProjectRepo, MessageRepo } from "../storage/repositories.js";
 import { logger } from "../utils/logger.js";
+import {
+  cleanupTempImageDir,
+  isDiscordImageAttachment,
+  prepareDiscordAttachmentsForCodex,
+} from "../utils/image-bridge.js";
 
 /**
  * Manages the bidirectional message sync between Discord threads and Codex threads.
@@ -19,9 +24,16 @@ export class MessageSync {
   /** Short-lived dedupe cache to suppress watcher echoes of Discord-origin turns. */
   private recentWatcherEchoes = new Map<
     string,
-    { expiresAt: number; user: Set<string>; assistant: Set<string> }
+    {
+      expiresAt: number;
+      user: Set<string>;
+      assistant: Set<string>;
+      userHasImages: boolean;
+      assistantHasImages: boolean;
+    }
   >();
   private static readonly WATCHER_ECHO_TTL_MS = 8_000;
+  private static readonly TYPING_HEARTBEAT_MS = 8_000;
 
   constructor(codexService: CodexService, verboseLevel: VerboseLevel = 1) {
     this.codexService = codexService;
@@ -32,10 +44,18 @@ export class MessageSync {
    * Handle a user message from Discord → send to Codex → stream response back.
    */
   async handleUserMessage(message: Message): Promise<void> {
-    const discordThreadId = message.channel.id;
-    const prompt = message.content;
+    const channel = message.channel as SendableChannels;
+    const discordThreadId = channel.id;
+    const prompt = message.content.trim();
+    const imageAttachments = [...message.attachments.values()].filter((attachment) =>
+      isDiscordImageAttachment({
+        url: attachment.url,
+        name: attachment.name,
+        contentType: attachment.contentType,
+      }),
+    );
 
-    if (!prompt.trim()) return;
+    if (!prompt && imageAttachments.length === 0) return;
     this.pruneExpiredWatcherEchoes();
 
     // Check if already processing
@@ -57,13 +77,47 @@ export class MessageSync {
       return;
     }
 
-    // Log user message
-    MessageRepo.create(threadRow.id, "user_to_codex", prompt, message.id);
-    this.startWatcherEchoSuppression(discordThreadId, prompt);
-
     this.processing.add(discordThreadId);
+    const stopTyping = this.startTypingHeartbeat(channel);
+    let tempImageDir: string | null = null;
 
     try {
+      const inputParts: UserInput[] = [];
+      if (prompt) {
+        inputParts.push({ type: "text", text: prompt });
+      }
+
+      if (imageAttachments.length > 0) {
+        const preparedImages = await prepareDiscordAttachmentsForCodex(
+          imageAttachments.map((attachment) => ({
+            url: attachment.url,
+            name: attachment.name,
+            contentType: attachment.contentType,
+          })),
+        );
+
+        tempImageDir = preparedImages.tempDir;
+        inputParts.push(...preparedImages.inputs);
+      }
+
+      if (inputParts.length === 0) {
+        await message
+          .reply("⚠️ No usable image attachment found in this message.")
+          .catch(() => {});
+        return;
+      }
+
+      const codexInput: Input =
+        inputParts.length === 1 && inputParts[0].type === "text"
+          ? inputParts[0].text
+          : inputParts;
+      const hasImages = inputParts.some((part) => part.type === "local_image");
+      const logContent =
+        prompt || `[${inputParts.filter((part) => part.type === "local_image").length} image attachment(s)]`;
+
+      MessageRepo.create(threadRow.id, "user_to_codex", logContent, message.id);
+      this.startWatcherEchoSuppression(discordThreadId, prompt, hasImages);
+
       // Get or create Codex thread
       const codexThread = this.codexService.getOrCreateThread(
         discordThreadId,
@@ -77,19 +131,19 @@ export class MessageSync {
 
       // Stream response
       await this.streamCodexResponse(
-        message.channel as SendableChannels,
+        channel,
         codexThread,
         threadRow,
-        prompt,
+        codexInput,
       );
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       logger.error("Error processing message", { error: errorMsg, discordThreadId });
-      await (message.channel as SendableChannels)
-        .send(`❌ **Error:** ${errorMsg.slice(0, 500)}`)
-        .catch(() => {});
+      await channel.send(`❌ **Error:** ${errorMsg.slice(0, 500)}`).catch(() => {});
       ThreadRepo.updateStatus(discordThreadId, "error");
     } finally {
+      await cleanupTempImageDir(tempImageDir);
+      stopTyping();
       this.processing.delete(discordThreadId);
       this.extendWatcherEchoSuppression(discordThreadId);
     }
@@ -99,9 +153,9 @@ export class MessageSync {
     channel: SendableChannels,
     codexThread: any, // Thread from SDK
     threadRow: any,
-    prompt: string,
+    input: Input,
   ): Promise<void> {
-    const { events } = await this.codexService.runStreamed(codexThread, prompt);
+    const { events } = await this.codexService.runStreamed(codexThread, input);
 
     let transientMessage: Message | null = null;
 
@@ -199,6 +253,31 @@ export class MessageSync {
     }
   }
 
+  private startTypingHeartbeat(channel: SendableChannels): () => void {
+    let active = true;
+
+    const pulseTyping = async (): Promise<void> => {
+      if (!active) return;
+
+      const maybeTypingChannel = channel as SendableChannels &
+        Partial<{ sendTyping: () => Promise<void> }>;
+      if (typeof maybeTypingChannel.sendTyping !== "function") return;
+
+      await maybeTypingChannel.sendTyping().catch(() => {});
+    };
+
+    void pulseTyping();
+    const interval = setInterval(() => {
+      void pulseTyping();
+    }, MessageSync.TYPING_HEARTBEAT_MS);
+    interval.unref?.();
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }
+
   isProcessing(discordThreadId: string): boolean {
     return this.processing.has(discordThreadId);
   }
@@ -207,6 +286,7 @@ export class MessageSync {
     discordThreadId: string,
     role: "user" | "assistant",
     text: string,
+    hasImages: boolean = false,
   ): boolean {
     this.pruneExpiredWatcherEchoes();
 
@@ -214,20 +294,27 @@ export class MessageSync {
     if (!entry) return false;
 
     const normalized = this.normalizeText(text);
-    if (!normalized) return false;
-
     const knownTexts = role === "user" ? entry.user : entry.assistant;
-    return knownTexts.has(normalized);
+    if (normalized && knownTexts.has(normalized)) return true;
+
+    if (role === "user" && hasImages && entry.userHasImages) return true;
+    if (role === "assistant" && hasImages && entry.assistantHasImages) return true;
+
+    return false;
   }
 
-  private startWatcherEchoSuppression(discordThreadId: string, prompt: string): void {
+  private startWatcherEchoSuppression(
+    discordThreadId: string,
+    prompt: string,
+    hasImages: boolean,
+  ): void {
     const normalized = this.normalizeText(prompt);
-    if (!normalized) return;
-
     this.recentWatcherEchoes.set(discordThreadId, {
       expiresAt: Date.now() + MessageSync.WATCHER_ECHO_TTL_MS,
-      user: new Set([normalized]),
+      user: normalized ? new Set([normalized]) : new Set<string>(),
       assistant: new Set<string>(),
+      userHasImages: hasImages,
+      assistantHasImages: false,
     });
   }
 

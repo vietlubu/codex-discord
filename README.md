@@ -81,6 +81,7 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=39
 | `/status` | Show bot status and statistics |
 | `/remove-project` | Remove a project and its channel |
 | `/sync-projects` | Scan local Codex sessions and create channels/threads |
+| `/add-session` | Add one existing Codex session by ID (including worktrees) and enable live sync |
 | `/sync-messages` | Replay messages from a Codex session into current thread |
 
 ## How It Works

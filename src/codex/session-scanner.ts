@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { logger } from "../utils/logger.js";
@@ -17,8 +18,20 @@ export interface CodexSession {
 export interface CodexSessionMessage {
   timestamp: string;
   role: "user" | "assistant" | "developer";
-  type: "text" | "function_call" | "function_call_output" | "reasoning" | "other";
+  type: "text" | "image" | "function_call" | "function_call_output" | "reasoning" | "other";
   text: string;
+  images?: SessionImageRef[];
+}
+
+export interface SessionImageRef {
+  source: "data_url" | "local_path" | "remote_url";
+  value: string;
+  mimeType?: string;
+}
+
+export interface SessionEventMessage {
+  text: string | null;
+  images: SessionImageRef[];
 }
 
 interface SessionMeta {
@@ -116,13 +129,32 @@ export function getSessionsForProject(projectPath: string, includeArchived: bool
 }
 
 /**
+ * Find a Codex session by exact session ID across all scanned projects/worktrees.
+ */
+export function getSessionById(
+  sessionId: string,
+  includeArchived: boolean = false,
+): CodexSession | undefined {
+  const normalizedId = sessionId.trim();
+  if (!normalizedId) return undefined;
+
+  const allSessions = scanAllSessions(includeArchived);
+  for (const sessions of allSessions.values()) {
+    const match = sessions.find((session) => session.id === normalizedId);
+    if (match) return match;
+  }
+
+  return undefined;
+}
+
+/**
  * Parse the messages from a Codex session JSONL file.
  * Only extracts user messages and agent (assistant) messages.
  */
 export function parseSessionMessages(filePath: string): CodexSessionMessage[] {
   const messages: CodexSessionMessage[] = [];
-  let lastUserText: string | undefined;
-  let lastAssistantText: string | undefined;
+  let lastUserSignature: string | undefined;
+  let lastAssistantSignature: string | undefined;
 
   try {
     const content = readFileSync(filePath, "utf-8");
@@ -134,30 +166,50 @@ export function parseSessionMessages(filePath: string): CodexSessionMessage[] {
         const timestamp =
           typeof parsed.timestamp === "string" ? parsed.timestamp : "";
 
-        for (const rawUserText of extractUserTextsFromSessionEvent(parsed)) {
-          const visibleText = extractVisibleUserMessage(rawUserText);
-          if (!visibleText) continue;
-          if (visibleText === lastUserText) continue;
+        for (const userMessage of extractUserMessagesFromSessionEvent(parsed)) {
+          const visibleText = userMessage.text
+            ? extractVisibleUserMessage(userMessage.text)
+            : null;
+          const hasImages = userMessage.images.length > 0;
+          if (!visibleText && !hasImages) continue;
+
+          const signature = buildSessionMessageSignature(
+            visibleText,
+            userMessage.images,
+          );
+          if (signature === lastUserSignature) continue;
 
           messages.push({
             timestamp,
             role: "user",
-            type: "text",
-            text: visibleText,
+            type: visibleText ? "text" : "image",
+            text: visibleText ?? "",
+            images: hasImages ? userMessage.images : undefined,
           });
-          lastUserText = visibleText;
+          lastUserSignature = signature;
         }
 
-        for (const assistantText of extractAssistantTextsFromSessionEvent(parsed)) {
-          if (assistantText === lastAssistantText) continue;
+        for (const assistantMessage of extractAssistantMessagesFromSessionEvent(parsed)) {
+          const assistantText = assistantMessage.text
+            ? coerceText(assistantMessage.text)
+            : null;
+          const hasImages = assistantMessage.images.length > 0;
+          if (!assistantText && !hasImages) continue;
+
+          const signature = buildSessionMessageSignature(
+            assistantText,
+            assistantMessage.images,
+          );
+          if (signature === lastAssistantSignature) continue;
 
           messages.push({
             timestamp,
             role: "assistant",
-            type: "text",
-            text: assistantText,
+            type: assistantText ? "text" : "image",
+            text: assistantText ?? "",
+            images: hasImages ? assistantMessage.images : undefined,
           });
-          lastAssistantText = assistantText;
+          lastAssistantSignature = signature;
         }
 
         if (parsed.type === "response_item") {
@@ -246,74 +298,96 @@ export function extractVisibleUserMessage(text: string): string | null {
   const normalized = text.replace(/\r\n?/g, "\n").trim();
   if (!normalized) return null;
 
-  if (isAgentsInstructionsMessage(normalized)) return null;
-  if (isInternalContextMessage(normalized)) return null;
+  const withoutImageTags = stripImageTagLines(normalized);
+  if (!withoutImageTags) return null;
 
-  return normalized;
+  if (isAgentsInstructionsMessage(withoutImageTags)) return null;
+  if (isInternalContextMessage(withoutImageTags)) return null;
+
+  return withoutImageTags;
 }
 
-export function extractUserTextsFromSessionEvent(parsed: any): string[] {
-  const texts: string[] = [];
+export function buildSessionMessageSignature(
+  text: string | null,
+  images: SessionImageRef[],
+): string {
+  const normalizedText = text?.replace(/\r\n?/g, "\n").trim() ?? "";
+  const imageSignature =
+    images.length === 0
+      ? ""
+      : images
+          .map((image) => `${image.source}:${shortHash(image.value)}`)
+          .join("|");
+  return `${normalizedText}::${imageSignature}`;
+}
+
+export function extractUserMessagesFromSessionEvent(parsed: any): SessionEventMessage[] {
+  const messages: SessionEventMessage[] = [];
 
   if (
     parsed?.type === "response_item" &&
     parsed.payload?.role === "user" &&
     parsed.payload?.type === "message"
   ) {
-    for (const item of parsed.payload.content ?? []) {
-      if (item?.type !== "input_text") continue;
-      const text = coerceText(item?.text ?? item?.value ?? item?.message);
-      if (text) texts.push(text);
-    }
+    const fromResponse = extractMessagesFromResponseContent(parsed.payload?.content);
+    messages.push(...fromResponse);
   }
 
   if (parsed?.type === "event_msg" && parsed.payload?.type === "user_message") {
-    const direct = coerceText(parsed.payload?.message);
-    if (direct) texts.push(direct);
-
-    if (Array.isArray(parsed.payload?.text_elements)) {
-      for (const item of parsed.payload.text_elements) {
-        const text = coerceText(item?.text ?? item?.value ?? item);
-        if (text) texts.push(text);
-      }
-    }
+    const fromEvent = extractMessagesFromEventPayload(parsed.payload);
+    messages.push(...fromEvent);
   }
 
-  return uniqueTexts(texts);
+  return uniqueMessages(messages);
 }
 
-export function extractAssistantTextsFromSessionEvent(parsed: any): string[] {
-  const texts: string[] = [];
+export function extractAssistantMessagesFromSessionEvent(
+  parsed: any,
+): SessionEventMessage[] {
+  const messages: SessionEventMessage[] = [];
 
   if (
     parsed?.type === "response_item" &&
     parsed.payload?.role === "assistant" &&
     parsed.payload?.type === "message"
   ) {
-    for (const item of parsed.payload.content ?? []) {
-      if (item?.type !== "output_text" && item?.type !== "text") continue;
-      const text = coerceText(item?.text ?? item?.value ?? item?.message);
-      if (text) texts.push(text);
-    }
+    const fromResponse = extractMessagesFromResponseContent(parsed.payload?.content);
+    messages.push(...fromResponse);
   }
 
   if (parsed?.type === "event_msg" && parsed.payload?.type === "agent_message") {
-    const direct = coerceText(parsed.payload?.message);
-    if (direct) texts.push(direct);
-
-    if (Array.isArray(parsed.payload?.text_elements)) {
-      for (const item of parsed.payload.text_elements) {
-        const text = coerceText(item?.text ?? item?.value ?? item);
-        if (text) texts.push(text);
-      }
-    }
+    const fromEvent = extractMessagesFromEventPayload(parsed.payload);
+    messages.push(...fromEvent);
   }
 
   if (parsed?.type === "event_msg" && parsed.payload?.type === "task_complete") {
     const finalMessage = coerceText(parsed.payload?.last_agent_message);
-    if (finalMessage) texts.push(finalMessage);
+    if (finalMessage) {
+      messages.push({
+        text: finalMessage,
+        images: [],
+      });
+    }
   }
 
+  return uniqueMessages(messages);
+}
+
+export function extractUserTextsFromSessionEvent(parsed: any): string[] {
+  const texts: string[] = [];
+  for (const message of extractUserMessagesFromSessionEvent(parsed)) {
+    const text = message.text ? coerceText(message.text) : null;
+    if (text) texts.push(text);
+  }
+  return uniqueTexts(texts);
+}
+
+export function extractAssistantTextsFromSessionEvent(parsed: any): string[] {
+  const texts: string[] = [];
+  for (const message of extractAssistantMessagesFromSessionEvent(parsed)) {
+    const text = message.text ? coerceText(message.text) : null;
+    if (text) texts.push(text);
+  }
   return uniqueTexts(texts);
 }
 
@@ -364,6 +438,172 @@ function uniqueTexts(texts: string[]): string[] {
   }
 
   return unique;
+}
+
+function stripImageTagLines(text: string): string {
+  const filtered = text
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      return trimmed !== "<image>" && trimmed !== "</image>";
+    })
+    .join("\n")
+    .trim();
+
+  return filtered.replace(/\n{3,}/g, "\n\n");
+}
+
+function extractMessagesFromResponseContent(content: unknown): SessionEventMessage[] {
+  if (!Array.isArray(content)) return [];
+
+  const textParts: string[] = [];
+  const images: SessionImageRef[] = [];
+
+  for (const item of content) {
+    const itemType = coerceText((item as any)?.type);
+    if (!itemType) continue;
+
+    if (
+      itemType === "input_text" ||
+      itemType === "output_text" ||
+      itemType === "text"
+    ) {
+      const text = coerceText(
+        (item as any)?.text ?? (item as any)?.value ?? (item as any)?.message,
+      );
+      if (text) textParts.push(text);
+      continue;
+    }
+
+    if (itemType === "input_image" || itemType === "output_image" || itemType === "image") {
+      const imageRef = parseImageRef((item as any)?.image_url ?? (item as any)?.url);
+      if (imageRef) images.push(imageRef);
+      continue;
+    }
+
+    if (itemType === "local_image") {
+      const imageRef = parseImageRef((item as any)?.path ?? (item as any)?.local_path);
+      if (imageRef) images.push(imageRef);
+      continue;
+    }
+  }
+
+  const text = textParts.join("\n").trim();
+  if (!text && images.length === 0) return [];
+
+  return [
+    {
+      text: text.length > 0 ? text : null,
+      images: uniqueImageRefs(images),
+    },
+  ];
+}
+
+function extractMessagesFromEventPayload(payload: any): SessionEventMessage[] {
+  if (!payload || typeof payload !== "object") return [];
+
+  const textParts: string[] = [];
+  const images: SessionImageRef[] = [];
+
+  const directText = coerceText(payload.message);
+  if (directText) textParts.push(directText);
+
+  if (Array.isArray(payload.text_elements)) {
+    for (const item of payload.text_elements) {
+      if (item && typeof item === "object") {
+        const itemType = coerceText((item as any).type);
+        if (
+          itemType === "input_image" ||
+          itemType === "output_image" ||
+          itemType === "image"
+        ) {
+          const imageRef = parseImageRef((item as any).image_url ?? (item as any).url);
+          if (imageRef) images.push(imageRef);
+          continue;
+        }
+      }
+
+      const text = coerceText((item as any)?.text ?? (item as any)?.value ?? item);
+      if (text) textParts.push(text);
+    }
+  }
+
+  if (Array.isArray(payload.images)) {
+    for (const rawImage of payload.images) {
+      const imageRef = parseImageRef(rawImage);
+      if (imageRef) images.push(imageRef);
+    }
+  }
+
+  if (Array.isArray(payload.local_images)) {
+    for (const localImage of payload.local_images) {
+      const imageRef = parseImageRef(localImage);
+      if (imageRef) images.push(imageRef);
+    }
+  }
+
+  const text = textParts.join("\n").trim();
+  if (!text && images.length === 0) return [];
+
+  return [
+    {
+      text: text.length > 0 ? text : null,
+      images: uniqueImageRefs(images),
+    },
+  ];
+}
+
+function parseImageRef(value: unknown): SessionImageRef | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!normalized) return null;
+
+  if (normalized.startsWith("data:image/")) {
+    const mimeTypeMatch = /^data:(image\/[a-zA-Z0-9.+-]+);base64,/i.exec(normalized);
+    return {
+      source: "data_url",
+      value: normalized,
+      mimeType: mimeTypeMatch?.[1]?.toLowerCase(),
+    };
+  }
+
+  if (/^https?:\/\//i.test(normalized)) {
+    return { source: "remote_url", value: normalized };
+  }
+
+  return { source: "local_path", value: normalized };
+}
+
+function uniqueImageRefs(images: SessionImageRef[]): SessionImageRef[] {
+  const seen = new Set<string>();
+  const unique: SessionImageRef[] = [];
+
+  for (const image of images) {
+    const key = `${image.source}:${shortHash(image.value)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(image);
+  }
+
+  return unique;
+}
+
+function uniqueMessages(messages: SessionEventMessage[]): SessionEventMessage[] {
+  const seen = new Set<string>();
+  const unique: SessionEventMessage[] = [];
+
+  for (const message of messages) {
+    const signature = buildSessionMessageSignature(message.text, message.images);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    unique.push(message);
+  }
+
+  return unique;
+}
+
+function shortHash(value: string): string {
+  return createHash("sha1").update(value).digest("hex").slice(0, 16);
 }
 
 // ─── Internal Helpers ────────────────────────────────────────────────

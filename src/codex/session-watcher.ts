@@ -62,6 +62,27 @@ export class SessionWatcher {
     }
   }
 
+  /**
+   * Start active tailing for an existing session file that has been manually linked.
+   * Resets baseline to current file size to avoid replay duplicates, then enables
+   * follow-up polling so append updates are still picked up if fs.watch misses events.
+   */
+  followExistingSession(filePath: string): void {
+    if (!existsSync(filePath)) return;
+
+    this.markSeen(filePath);
+    const session = parseSessionMeta(filePath);
+    if (session) {
+      this.sessionCache.set(filePath, session);
+    }
+
+    this.extendFollowUpPolling(filePath);
+    logger.debug("Session watcher follow existing session", {
+      filePath,
+      session: session?.id?.slice(0, 12),
+    });
+  }
+
   start(): void {
     if (!existsSync(SESSIONS_DIR)) {
       logger.warn("Codex sessions directory not found, watcher not started", {

@@ -1,5 +1,5 @@
 import { Codex } from "@openai/codex-sdk";
-import type { Thread, RunStreamedResult } from "@openai/codex-sdk";
+import type { Thread, RunStreamedResult, Input } from "@openai/codex-sdk";
 import type { Config } from "../config/index.js";
 import { logger } from "../utils/logger.js";
 
@@ -89,8 +89,8 @@ export class CodexService {
   /**
    * Run a prompt with streaming, returns the event generator.
    */
-  async runStreamed(thread: Thread, prompt: string): Promise<RunStreamedResult> {
-    return thread.runStreamed(prompt);
+  async runStreamed(thread: Thread, input: Input): Promise<RunStreamedResult> {
+    return thread.runStreamed(input);
   }
 
   /**

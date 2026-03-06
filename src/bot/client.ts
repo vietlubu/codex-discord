@@ -20,18 +20,22 @@ import { ProjectRepo, ThreadRepo } from "../storage/repositories.js";
 import {
   scanAllSessions,
   getSessionsForProject,
+  getSessionById,
   parseSessionMessages,
   getSessionDisplayName,
   getSessionTitle,
-  extractAssistantTextsFromSessionEvent,
+  extractAssistantMessagesFromSessionEvent,
+  buildSessionMessageSignature,
   extractVisibleUserMessage,
-  extractUserTextsFromSessionEvent,
+  extractUserMessagesFromSessionEvent,
   type CodexSession,
+  type SessionImageRef,
 } from "../codex/session-scanner.js";
 import { SessionWatcher } from "../codex/session-watcher.js";
 import { logger } from "../utils/logger.js";
 import { COLORS, CATEGORY_PREFIX, STATUS_EMOJI, DISCORD_MSG_LIMIT, splitMessage } from "../utils/constants.js";
 import { canonicalizeProjectPath } from "../utils/path.js";
+import { chunkDiscordFiles, prepareSessionImagesForDiscord } from "../utils/image-bridge.js";
 
 /**
  * Discord bot client — handles events, slash commands, and bridges to Codex.
@@ -371,44 +375,87 @@ export class DiscordBot {
     for (const line of newLines) {
       try {
         const parsed = JSON.parse(line);
-        const sendAssistant = async (text: string) => {
-          const normalized = String(text).trim();
-          if (!normalized) return;
-          // Some Codex log formats emit both response_item assistant text and event_msg agent_message.
-          if (sentAssistantBatch.has(normalized)) return;
-          sentAssistantBatch.add(normalized);
-          extractedAssistant++;
-          const ok = await sendChunked("🤖 **Codex:**", normalized, "assistant");
-          if (ok) sentAssistant++;
-        };
-        for (const rawUserText of extractUserTextsFromSessionEvent(parsed)) {
-          const visibleText = extractVisibleUserMessage(rawUserText);
-          if (!visibleText) continue;
+        for (const userMessage of extractUserMessagesFromSessionEvent(parsed)) {
+          const visibleText = userMessage.text
+            ? extractVisibleUserMessage(userMessage.text)
+            : null;
+          const hasImages = userMessage.images.length > 0;
+          if (!visibleText && !hasImages) continue;
+
           if (
             this.messageSync.shouldSuppressSessionEcho(
               threadRow.discord_thread_id,
               "user",
-              visibleText,
+              visibleText ?? "",
+              hasImages,
             )
           ) {
             continue;
           }
-          if (sentUserBatch.has(visibleText)) continue;
-          sentUserBatch.add(visibleText);
-          await sendChunked("👤 **User:**", visibleText, "user");
+
+          const signature = buildSessionMessageSignature(
+            visibleText,
+            userMessage.images,
+          );
+          if (sentUserBatch.has(signature)) continue;
+          sentUserBatch.add(signature);
+
+          if (visibleText) {
+            await sendChunked("👤 **User:**", visibleText, "user");
+          }
+          if (hasImages) {
+            const ok = await this.sendImageRefs(
+              channel,
+              userMessage.images,
+              "user",
+              visibleText ? undefined : "👤 **User:**",
+            );
+            if (!ok) sendFailures++;
+          }
         }
 
-        for (const assistantText of extractAssistantTextsFromSessionEvent(parsed)) {
+        for (const assistantMessage of extractAssistantMessagesFromSessionEvent(parsed)) {
+          const assistantText = assistantMessage.text?.trim() || "";
+          const hasImages = assistantMessage.images.length > 0;
+          if (!assistantText && !hasImages) continue;
+
           if (
             this.messageSync.shouldSuppressSessionEcho(
               threadRow.discord_thread_id,
               "assistant",
               assistantText,
+              hasImages,
             )
           ) {
             continue;
           }
-          await sendAssistant(assistantText);
+
+          const signature = buildSessionMessageSignature(
+            assistantText || null,
+            assistantMessage.images,
+          );
+          if (sentAssistantBatch.has(signature)) continue;
+          sentAssistantBatch.add(signature);
+
+          extractedAssistant++;
+          let sent = false;
+
+          if (assistantText) {
+            const ok = await sendChunked("🤖 **Codex:**", assistantText, "assistant");
+            sent = sent || ok;
+          }
+          if (hasImages) {
+            const ok = await this.sendImageRefs(
+              channel,
+              assistantMessage.images,
+              "assistant",
+              assistantText ? undefined : "🤖 **Codex:**",
+            );
+            sent = sent || ok;
+            if (!ok) sendFailures++;
+          }
+
+          if (sent) sentAssistant++;
         }
       } catch {
         // Skip unparseable lines
@@ -422,6 +469,37 @@ export class DiscordBot {
         extractedAssistant,
         sendFailures,
       });
+    }
+  }
+
+  private async sendImageRefs(
+    channel: any,
+    imageRefs: SessionImageRef[],
+    role: "user" | "assistant",
+    fallbackPrefix?: string,
+  ): Promise<boolean> {
+    try {
+      const files = await prepareSessionImagesForDiscord(imageRefs, role);
+      if (files.length === 0) return false;
+
+      const fileChunks = chunkDiscordFiles(files);
+      let sentAny = false;
+      for (let index = 0; index < fileChunks.length; index++) {
+        const payload: any = { files: fileChunks[index] };
+        if (index === 0 && fallbackPrefix) {
+          payload.content = fallbackPrefix;
+        }
+        await channel.send(payload);
+        sentAny = true;
+      }
+
+      return sentAny;
+    } catch (error) {
+      logger.warn("Auto-sync: failed to send image refs", {
+        role,
+        error: serializeError(error),
+      });
+      return false;
     }
   }
 
@@ -602,6 +680,18 @@ export class DiscordBot {
         ),
 
       new SlashCommandBuilder()
+        .setName("add-session")
+        .setDescription(
+          "Add one Codex session by ID (including worktrees), create a thread, and start live sync",
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName("session_id")
+            .setDescription("Codex session ID to add")
+            .setRequired(true),
+        ),
+
+      new SlashCommandBuilder()
         .setName("sync-messages")
         .setDescription(
           "Replay messages from a Codex session into the current thread",
@@ -656,6 +746,9 @@ export class DiscordBot {
         break;
       case "sync-projects":
         await this.handleSyncProjects(interaction);
+        break;
+      case "add-session":
+        await this.handleAddSession(interaction);
         break;
       case "sync-messages":
         await this.handleSyncMessages(interaction);
@@ -1003,6 +1096,224 @@ export class DiscordBot {
   }
 
   /**
+   * /add-session — Add one existing Codex session to the mapped project.
+   * Creates a new Discord thread, replays session history, then keeps live sync.
+   */
+  private async handleAddSession(interaction: any): Promise<void> {
+    await interaction.deferReply({ ephemeral: true });
+
+    const requestedSessionId = interaction.options
+      .getString("session_id", true)
+      .trim();
+    const projectChannelId = interaction.channel?.isThread?.()
+      ? interaction.channel.parentId
+      : interaction.channelId;
+
+    if (!projectChannelId) {
+      await interaction.editReply("❌ Cannot determine the project channel.");
+      return;
+    }
+
+    const project = ProjectRepo.getByChannelId(projectChannelId);
+    if (!project) {
+      await interaction.editReply(
+        "❌ This command must be used in a mapped project channel (or a thread inside it).",
+      );
+      return;
+    }
+
+    const projectSessions = getSessionsForProject(
+      project.project_path,
+      this.config.codex.syncArchived,
+    );
+    const session =
+      projectSessions.find((s) => s.id === requestedSessionId) ??
+      getSessionById(requestedSessionId, this.config.codex.syncArchived);
+    if (!session) {
+      const lines = projectSessions
+        .slice(0, 15)
+        .map(
+          (s) =>
+            `\`${s.id}\` — ${getSessionDisplayName(s)} (${s.model ?? "default"})`,
+        );
+      await interaction.editReply(
+        `❌ Session not found: \`${requestedSessionId}\`\n\n` +
+          `**Available sessions for ${project.project_name}:**\n${lines.join("\n") || "None"}`,
+      );
+      return;
+    }
+
+    const projectPath = canonicalizeProjectPath(project.project_path);
+    const isCrossPathSession = session.cwd !== projectPath;
+
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.editReply("❌ Guild is not available.");
+      return;
+    }
+
+    const existingMapping = ThreadRepo.getByCodexThreadId(session.id);
+    if (existingMapping) {
+      try {
+        const existingThread = await guild.channels.fetch(
+          existingMapping.discord_thread_id,
+        );
+        if (existingThread) {
+          this.sessionWatcher.followExistingSession(session.filePath);
+          await interaction.editReply(
+            `${STATUS_EMOJI.DONE} Session \`${session.id}\` is already linked in <#${existingMapping.discord_thread_id}>.\n` +
+              "Live sync watcher has been re-attached.",
+          );
+          return;
+        }
+
+        ThreadRepo.delete(existingMapping.id);
+        logger.info("Removed stale add-session mapping", {
+          session: session.id.slice(0, 12),
+          discordThreadId: existingMapping.discord_thread_id,
+          reason: "channel_not_found",
+        });
+      } catch (error: any) {
+        const code = error?.code;
+        if (code === 10003 || code === 50001) {
+          ThreadRepo.delete(existingMapping.id);
+          logger.info("Removed stale add-session mapping", {
+            session: session.id.slice(0, 12),
+            discordThreadId: existingMapping.discord_thread_id,
+            errorCode: code,
+          });
+        } else {
+          await interaction.editReply(
+            `❌ Failed to validate existing session mapping: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return;
+        }
+      }
+    }
+
+    let projectChannel: any;
+    try {
+      projectChannel = await guild.channels.fetch(project.channel_id);
+    } catch (error) {
+      await interaction.editReply(
+        `❌ Cannot access project channel <#${project.channel_id}>: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+
+    if (!projectChannel?.isTextBased?.() || !projectChannel.threads?.create) {
+      await interaction.editReply("❌ Project channel does not support threads.");
+      return;
+    }
+
+    const threadName = getSessionTitle(session);
+
+    try {
+      const discordThread = await projectChannel.threads.create({
+        name: threadName,
+        autoArchiveDuration: 10080, // 7 days
+      });
+
+      const mappedThread = ThreadRepo.getByCodexThreadId(session.id);
+      if (mappedThread && mappedThread.discord_thread_id !== discordThread.id) {
+        await discordThread
+          .delete("Duplicate Codex session thread prevented")
+          .catch(() => {});
+        await interaction.editReply(
+          `⚠️ Session \`${session.id}\` was mapped concurrently in <#${mappedThread.discord_thread_id}>.`,
+        );
+        return;
+      }
+
+      const alreadyMapped = ThreadRepo.getByDiscordThreadId(discordThread.id);
+      if (alreadyMapped) {
+        if (!alreadyMapped.codex_thread_id) {
+          ThreadRepo.updateCodexThreadId(discordThread.id, session.id);
+        }
+      } else {
+        ThreadRepo.create(discordThread.id, project.id, threadName, session.id);
+      }
+
+      const droppedBufferedLines =
+        this.pendingSessionLines.get(session.id)?.length ?? 0;
+      if (droppedBufferedLines > 0) {
+        this.pendingSessionLines.delete(session.id);
+        logger.debug("Dropped buffered lines before replaying add-session", {
+          session: session.id.slice(0, 12),
+          droppedBufferedLines,
+        });
+      }
+
+      const threadEmbed = new EmbedBuilder()
+        .setColor(COLORS.INFO)
+        .setDescription(
+          `🔗 Codex session \`${session.id.slice(0, 12)}...\`\n` +
+            `📅 ${session.timestamp}\n` +
+            `🤖 ${session.model ?? "default"}\n` +
+            `📁 ${session.cwd}\n\n` +
+            `Replaying history now. Live updates stay synced while the session is running.`,
+        )
+        .setTimestamp();
+      await discordThread.send({ embeds: [threadEmbed] });
+
+      const replay = await this.replaySessionMessagesToThread(
+        discordThread,
+        session.filePath,
+        discordThread.id,
+      );
+
+      if (replay.total === 0) {
+        await discordThread.send({
+          content: "No chat messages found in this session. Live sync is active.",
+        });
+      } else {
+        const doneEmbed = new EmbedBuilder()
+          .setColor(COLORS.SUCCESS)
+          .setDescription(
+            `${STATUS_EMOJI.DONE} Synced **${replay.sent}** messages from Codex session.` +
+              (replay.failed > 0
+                ? `\n⚠️ Failed chunks: **${replay.failed}**`
+                : ""),
+          )
+          .setTimestamp();
+        await discordThread.send({ embeds: [doneEmbed] });
+      }
+
+      this.sessionWatcher.followExistingSession(session.filePath);
+
+      await interaction.editReply(
+        `${STATUS_EMOJI.DONE} Added session \`${session.id}\` to <#${discordThread.id}>.\n` +
+          (isCrossPathSession
+            ? `Source path: \`${session.cwd}\` (different from project path).\n`
+            : "") +
+          (replay.total === 0
+            ? "No history messages to replay."
+            : `Replayed ${replay.sent}/${replay.total} messages (failed chunks: ${replay.failed}).`) +
+          `\nLive auto-sync is now active for this session.`,
+      );
+
+      logger.info("Session added from slash command", {
+        session: session.id.slice(0, 12),
+        project: project.project_name,
+        discordThreadId: discordThread.id,
+        replayTotal: replay.total,
+        replaySent: replay.sent,
+        replayFailed: replay.failed,
+      });
+    } catch (error) {
+      await interaction.editReply(
+        `❌ Failed to add session: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * /sync-messages — Replay messages from a Codex session JSONL file
    * into the current Discord thread.
    */
@@ -1010,7 +1321,8 @@ export class DiscordBot {
     await interaction.deferReply();
 
     const discordThreadId = interaction.channelId;
-    const requestedSessionId = interaction.options.getString("session_id");
+    const requestedSessionIdRaw = interaction.options.getString("session_id");
+    const requestedSessionId = requestedSessionIdRaw?.trim();
 
     // Must be in a thread
     if (!interaction.channel?.isThread?.()) {
@@ -1035,29 +1347,37 @@ export class DiscordBot {
       return;
     }
 
+    const projectSessions = getSessionsForProject(
+      project.project_path,
+      this.config.codex.syncArchived,
+    );
+    const projectPath = canonicalizeProjectPath(project.project_path);
+
     // Find the session to sync
-    let sessionFilePath: string | null = null;
+    let sessionToSync: CodexSession | null = null;
 
     if (requestedSessionId) {
       // User specified a session ID
-      const sessions = getSessionsForProject(project.project_path, this.config.codex.syncArchived);
-      const match = sessions.find((s) => s.id === requestedSessionId);
+      const match =
+        projectSessions.find((s) => s.id === requestedSessionId) ??
+        getSessionById(requestedSessionId, this.config.codex.syncArchived);
       if (!match) {
         await interaction.editReply(
           `❌ Session not found: \`${requestedSessionId}\``,
         );
         return;
       }
-      sessionFilePath = match.filePath;
+      sessionToSync = match;
     } else if (threadRow.codex_thread_id) {
       // Use the session linked to this thread
-      const sessions = getSessionsForProject(project.project_path, this.config.codex.syncArchived);
-      const match = sessions.find((s) => s.id === threadRow.codex_thread_id);
+      const match =
+        projectSessions.find((s) => s.id === threadRow.codex_thread_id) ??
+        getSessionById(threadRow.codex_thread_id, this.config.codex.syncArchived);
       if (match) {
-        sessionFilePath = match.filePath;
+        sessionToSync = match;
       } else {
         // List available sessions
-        const lines = sessions
+        const lines = projectSessions
           .slice(0, 15)
           .map(
             (s) =>
@@ -1072,14 +1392,13 @@ export class DiscordBot {
       }
     } else {
       // No session linked — list available sessions
-      const sessions = getSessionsForProject(project.project_path, this.config.codex.syncArchived);
-      if (sessions.length === 0) {
+      if (projectSessions.length === 0) {
         await interaction.editReply(
           "❌ No Codex sessions found for this project.",
         );
         return;
       }
-      const lines = sessions
+      const lines = projectSessions
         .slice(0, 15)
         .map(
           (s) =>
@@ -1092,43 +1411,123 @@ export class DiscordBot {
       return;
     }
 
+    if (!sessionToSync) {
+      await interaction.editReply("❌ Session not found.");
+      return;
+    }
+
+    const isCrossPathSession = sessionToSync.cwd !== projectPath;
+
     // Parse and send messages
     try {
-      const messages = parseSessionMessages(sessionFilePath!);
-      const replayMessages = messages.filter(
-        (m) => m.role === "user" || (m.role === "assistant" && m.type === "text"),
+      await interaction.editReply(
+        `${STATUS_EMOJI.WORKING} Syncing messages from session...`,
       );
 
-      if (replayMessages.length === 0) {
+      const thread = interaction.channel;
+      const replay = await this.replaySessionMessagesToThread(
+        thread,
+        sessionToSync.filePath,
+        discordThreadId,
+      );
+
+      this.sessionWatcher.followExistingSession(sessionToSync.filePath);
+
+      if (replay.total === 0) {
         await interaction.editReply(
-          "No chat messages found in this session.",
+          "No chat messages found in this session.\n" +
+            (isCrossPathSession
+              ? `Source path: \`${sessionToSync.cwd}\` (different from project path).\n`
+              : "") +
+            "Live sync watcher has been re-attached.",
         );
         return;
       }
 
-      const userCount = replayMessages.filter((m) => m.role === "user").length;
-      const assistantCount = replayMessages.filter(
-        (m) => m.role === "assistant" && m.type === "text",
-      ).length;
-
       await interaction.editReply(
-        `${STATUS_EMOJI.WORKING} Syncing **${replayMessages.length}** messages ` +
-          `(user: ${userCount}, codex: ${assistantCount})...`,
+        `${STATUS_EMOJI.DONE} Synced **${replay.sent}/${replay.total}** messages ` +
+          `(user: ${replay.userCount}, codex: ${replay.assistantCount}).` +
+          (replay.failed > 0 ? ` Failed chunks: ${replay.failed}.` : "") +
+          (isCrossPathSession
+            ? `\nSource path: \`${sessionToSync.cwd}\` (different from project path).`
+            : "") +
+          "\nLive sync watcher has been re-attached.",
       );
 
-      const thread = interaction.channel;
-      let sent = 0;
-      let failed = 0;
+      const doneEmbed = new EmbedBuilder()
+        .setColor(COLORS.SUCCESS)
+        .setDescription(
+          `${STATUS_EMOJI.DONE} Synced **${replay.sent}** messages from Codex session.` +
+            (replay.failed > 0
+              ? `\n⚠️ Failed chunks: **${replay.failed}**`
+              : ""),
+        )
+        .setTimestamp();
+      await thread.send({ embeds: [doneEmbed] });
 
-      for (const msg of replayMessages) {
-        const prefix = msg.role === "user" ? "👤 **User:**" : "🤖 **Codex:**";
-        const fullContent = `${prefix}\n${msg.text}`;
+      logger.info("Sync messages complete", {
+        session: sessionToSync.id.slice(0, 12),
+        sent: replay.sent,
+        failed: replay.failed,
+        userCount: replay.userCount,
+        assistantCount: replay.assistantCount,
+        threadId: discordThreadId,
+      });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`❌ Sync failed: ${errorMsg}`);
+    }
+  }
 
-        // Split long messages into chunks
+  private async replaySessionMessagesToThread(
+    thread: any,
+    sessionFilePath: string,
+    discordThreadId: string,
+  ): Promise<{
+    total: number;
+    userCount: number;
+    assistantCount: number;
+    sent: number;
+    failed: number;
+  }> {
+    const messages = parseSessionMessages(sessionFilePath);
+    const replayMessages = messages.filter(
+      (m) =>
+        m.role === "user" ||
+        (m.role === "assistant" && (m.type === "text" || m.type === "image")),
+    );
+
+    const userCount = replayMessages.filter((m) => m.role === "user").length;
+    const assistantCount = replayMessages.filter(
+      (m) => m.role === "assistant",
+    ).length;
+
+    if (replayMessages.length === 0) {
+      return {
+        total: 0,
+        userCount,
+        assistantCount,
+        sent: 0,
+        failed: 0,
+      };
+    }
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const msg of replayMessages) {
+      const prefix = msg.role === "user" ? "👤 **User:**" : "🤖 **Codex:**";
+      const text = msg.text?.trim() ?? "";
+      const hasImages = (msg.images?.length ?? 0) > 0;
+      let sentCurrent = false;
+
+      if (text) {
+        const fullContent = `${prefix}\n${text}`;
         const chunks = splitMessage(fullContent);
         for (const chunk of chunks) {
           try {
             await thread.send({ content: chunk });
+            sentCurrent = true;
           } catch (error) {
             failed++;
             logger.warn("Sync messages: failed to send replay chunk", {
@@ -1139,34 +1538,37 @@ export class DiscordBot {
             break;
           }
         }
-        sent++;
+      }
 
-        // Rate limit: don't flood
-        if (sent % 5 === 0) {
-          await new Promise((r) => setTimeout(r, 1000));
+      if (hasImages) {
+        const imageSent = await this.sendImageRefs(
+          thread,
+          msg.images ?? [],
+          msg.role === "user" ? "user" : "assistant",
+          text ? undefined : prefix,
+        );
+        if (imageSent) {
+          sentCurrent = true;
+        } else {
+          failed++;
         }
       }
 
-      const doneEmbed = new EmbedBuilder()
-        .setColor(COLORS.SUCCESS)
-        .setDescription(
-          `${STATUS_EMOJI.DONE} Synced **${sent}** messages from Codex session.` +
-            (failed > 0 ? `\n⚠️ Failed chunks: **${failed}**` : ""),
-        )
-        .setTimestamp();
-      await thread.send({ embeds: [doneEmbed] });
+      if (sentCurrent) sent++;
 
-      logger.info("Sync messages complete", {
-        sent,
-        failed,
-        userCount,
-        assistantCount,
-        threadId: discordThreadId,
-      });
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      await interaction.editReply(`❌ Sync failed: ${errorMsg}`);
+      // Rate limit: don't flood
+      if (sent > 0 && sent % 5 === 0) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
     }
+
+    return {
+      total: replayMessages.length,
+      userCount,
+      assistantCount,
+      sent,
+      failed,
+    };
   }
 }
 
