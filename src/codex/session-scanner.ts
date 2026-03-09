@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { logger } from "../utils/logger.js";
-import { canonicalizeProjectPath } from "../utils/path.js";
+import {
+  canonicalizeProjectPath,
+  getProjectKey,
+  pickPreferredProjectPath,
+} from "../utils/path.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -76,21 +80,24 @@ const CODEX_HOME = join(homedir(), ".codex");
 const SESSIONS_DIR = join(CODEX_HOME, "sessions");
 const ARCHIVED_DIR = join(CODEX_HOME, "archived_sessions");
 
+interface ProjectSessionGroup {
+  projectPath: string;
+  sessions: CodexSession[];
+}
+
 /**
  * Scan all Codex sessions from disk (~/.codex/sessions/ and ~/.codex/archived_sessions/).
- * Returns sessions grouped by their working directory (cwd = project path).
+ * Returns sessions grouped by stable project identity so root/worktree sessions stay together.
  */
 export function scanAllSessions(includeArchived: boolean = false): Map<string, CodexSession[]> {
-  const sessions = new Map<string, CodexSession[]>();
+  const groups = new Map<string, ProjectSessionGroup>();
 
   // Scan active sessions
   const activeFiles = findJsonlFiles(SESSIONS_DIR);
   for (const filePath of activeFiles) {
     const session = parseSessionMeta(filePath);
     if (session) {
-      const list = sessions.get(session.cwd) ?? [];
-      list.push(session);
-      sessions.set(session.cwd, list);
+      addSessionToGroups(groups, session);
     }
   }
 
@@ -100,16 +107,16 @@ export function scanAllSessions(includeArchived: boolean = false): Map<string, C
     for (const filePath of archivedFiles) {
       const session = parseSessionMeta(filePath);
       if (session) {
-        const list = sessions.get(session.cwd) ?? [];
-        list.push(session);
-        sessions.set(session.cwd, list);
+        addSessionToGroups(groups, session);
       }
     }
   }
 
   // Sort each project's sessions by timestamp (newest first)
-  for (const [, list] of sessions) {
-    list.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const sessions = new Map<string, CodexSession[]>();
+  for (const group of groups.values()) {
+    group.sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    sessions.set(group.projectPath, group.sessions);
   }
 
   logger.info("Session scan complete", {
@@ -125,7 +132,15 @@ export function scanAllSessions(includeArchived: boolean = false): Map<string, C
  */
 export function getSessionsForProject(projectPath: string, includeArchived: boolean = false): CodexSession[] {
   const allSessions = scanAllSessions(includeArchived);
-  return allSessions.get(canonicalizeProjectPath(projectPath)) ?? [];
+  const projectKey = getProjectKey(projectPath);
+
+  for (const [groupPath, sessions] of allSessions) {
+    if (getProjectKey(groupPath) === projectKey) {
+      return sessions;
+    }
+  }
+
+  return [];
 }
 
 /**
@@ -643,6 +658,25 @@ export function parseSessionMeta(filePath: string): CodexSession | null {
   } catch {
     return null;
   }
+}
+
+function addSessionToGroups(
+  groups: Map<string, ProjectSessionGroup>,
+  session: CodexSession,
+): void {
+  const projectKey = getProjectKey(session.cwd);
+  const existing = groups.get(projectKey);
+
+  if (!existing) {
+    groups.set(projectKey, {
+      projectPath: session.cwd,
+      sessions: [session],
+    });
+    return;
+  }
+
+  existing.projectPath = pickPreferredProjectPath(existing.projectPath, session.cwd);
+  existing.sessions.push(session);
 }
 
 function findJsonlFiles(dir: string): string[] {

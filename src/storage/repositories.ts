@@ -1,4 +1,5 @@
 import { getDatabase, saveDatabase } from "./database.js";
+import { getProjectKey } from "../utils/path.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -6,6 +7,7 @@ export interface ProjectRow {
   id: number;
   channel_id: string;
   project_path: string;
+  project_key: string;
   project_name: string;
   model: string | null;
   approval_mode: string | null;
@@ -79,16 +81,20 @@ export const ProjectRepo = {
     model?: string,
     approvalMode?: string,
   ): ProjectRow {
+    const projectKey = getProjectKey(projectPath);
+
     try {
       execute(
-        `INSERT INTO projects (channel_id, project_path, project_name, model, approval_mode)
-         VALUES (?, ?, ?, ?, ?)`,
-        [channelId, projectPath, projectName, model ?? null, approvalMode ?? null],
+        `INSERT INTO projects (channel_id, project_path, project_key, project_name, model, approval_mode)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [channelId, projectPath, projectKey, projectName, model ?? null, approvalMode ?? null],
       );
     } catch (error) {
       if (isUniqueConstraintError(error)) {
         const existing =
-          this.getByProjectPath(projectPath) ?? this.getByChannelId(channelId);
+          this.getByProjectKey(projectKey) ??
+          this.getByProjectPath(projectPath) ??
+          this.getByChannelId(channelId);
         if (existing) return existing;
       }
       throw error;
@@ -110,12 +116,20 @@ export const ProjectRepo = {
     return queryOne<ProjectRow>("SELECT * FROM projects WHERE project_path = ?", [projectPath]);
   },
 
+  getByProjectKey(projectKey: string): ProjectRow | undefined {
+    return queryOne<ProjectRow>("SELECT * FROM projects WHERE project_key = ?", [projectKey]);
+  },
+
   getAll(): ProjectRow[] {
     return queryAll<ProjectRow>("SELECT * FROM projects ORDER BY created_at DESC");
   },
 
   updateProjectPath(id: number, projectPath: string): void {
-    execute("UPDATE projects SET project_path = ? WHERE id = ?", [projectPath, id]);
+    execute("UPDATE projects SET project_path = ?, project_key = ? WHERE id = ?", [
+      projectPath,
+      getProjectKey(projectPath),
+      id,
+    ]);
   },
 
   delete(id: number): void {

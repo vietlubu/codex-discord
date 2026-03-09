@@ -32,9 +32,18 @@ import {
   type SessionImageRef,
 } from "../codex/session-scanner.js";
 import { SessionWatcher } from "../codex/session-watcher.js";
+import {
+  discoveredSessionModelSelection,
+  formatModelSelection,
+  parseProjectModelInput,
+} from "../codex/model.js";
 import { logger } from "../utils/logger.js";
 import { COLORS, CATEGORY_PREFIX, STATUS_EMOJI, DISCORD_MSG_LIMIT, splitMessage } from "../utils/constants.js";
-import { canonicalizeProjectPath } from "../utils/path.js";
+import {
+  canonicalizeProjectPath,
+  getProjectKey,
+  pickPreferredProjectPath,
+} from "../utils/path.js";
 import { chunkDiscordFiles, prepareSessionImagesForDiscord } from "../utils/image-bridge.js";
 
 /**
@@ -116,18 +125,19 @@ export class DiscordBot {
     model: string | undefined;
     filePath: string;
   }): Promise<void> {
-    // Serialize by canonical project path to prevent duplicate channel/thread creation.
+    // Serialize by stable project key so worktrees reuse the same channel mapping.
     const projectPath = canonicalizeProjectPath(session.cwd);
-    const prev = this.syncLocks.get(projectPath) ?? Promise.resolve();
+    const projectKey = getProjectKey(projectPath);
+    const prev = this.syncLocks.get(projectKey) ?? Promise.resolve();
     const current = prev.then(() => this._handleNewSessionImpl(session, projectPath));
     const guarded = current.catch(() => {});
-    this.syncLocks.set(projectPath, guarded);
+    this.syncLocks.set(projectKey, guarded);
 
     try {
       await current;
     } finally {
-      if (this.syncLocks.get(projectPath) === guarded) {
-        this.syncLocks.delete(projectPath);
+      if (this.syncLocks.get(projectKey) === guarded) {
+        this.syncLocks.delete(projectKey);
       }
     }
   }
@@ -194,7 +204,7 @@ export class DiscordBot {
         projectChannel.id,
         projectPath,
         projectName,
-        session.model,
+        discoveredSessionModelSelection(session.model),
       );
 
       if (!project) {
@@ -225,7 +235,7 @@ export class DiscordBot {
           .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
           .setDescription(
             `📁 **Path:** \`${projectPath}\`\n` +
-              `🤖 **Model:** ${session.model ?? this.config.codex.model}\n\n` +
+              `🤖 **Model:** ${formatModelSelection(project.model, this.config.codex.model)}\n\n` +
               `Auto-synced from new Codex session.`,
           )
           .setTimestamp();
@@ -277,7 +287,7 @@ export class DiscordBot {
         .setDescription(
           `🔗 Codex session \`${session.id.slice(0, 12)}...\`\n` +
             `📅 ${session.timestamp}\n` +
-            `🤖 ${session.model ?? "default"}\n\n` +
+            `🤖 ${formatModelSelection(session.model)}\n\n` +
             `Use \`/sync-messages\` to replay this session.`,
         )
         .setTimestamp();
@@ -297,21 +307,30 @@ export class DiscordBot {
   }
 
   private findProjectByPath(projectPath: string) {
-    const byPath = ProjectRepo.getByProjectPath(projectPath);
+    const canonicalProjectPath = canonicalizeProjectPath(projectPath);
+    const byPath = ProjectRepo.getByProjectPath(canonicalProjectPath);
     if (byPath) return byPath;
 
-    const all = ProjectRepo.getAll();
-    for (const project of all) {
-      if (canonicalizeProjectPath(project.project_path) === projectPath) {
-        if (project.project_path !== projectPath) {
-          ProjectRepo.updateProjectPath(project.id, projectPath);
-          return { ...project, project_path: projectPath };
-        }
-        return project;
-      }
+    const projectKey = getProjectKey(canonicalProjectPath);
+    const byKey = ProjectRepo.getByProjectKey(projectKey);
+    if (!byKey) {
+      return undefined;
     }
 
-    return undefined;
+    const preferredPath = pickPreferredProjectPath(
+      byKey.project_path,
+      canonicalProjectPath,
+    );
+    if (preferredPath !== byKey.project_path) {
+      ProjectRepo.updateProjectPath(byKey.id, preferredPath);
+      return {
+        ...byKey,
+        project_key: getProjectKey(preferredPath),
+        project_path: preferredPath,
+      };
+    }
+
+    return byKey;
   }
 
   /**
@@ -647,7 +666,7 @@ export class DiscordBot {
         .addStringOption((opt) =>
           opt
             .setName("model")
-            .setDescription("Codex model to use (e.g. o4-mini, gpt-4.1)")
+            .setDescription("Codex model to use, or `default` to use Codex's configured default")
             .setRequired(false),
         ),
 
@@ -763,7 +782,7 @@ export class DiscordBot {
 
     const requestedPath = interaction.options.getString("project_path", true);
     const customName = interaction.options.getString("name");
-    const model = interaction.options.getString("model");
+    const model = parseProjectModelInput(interaction.options.getString("model"));
     const projectPath = canonicalizeProjectPath(requestedPath);
 
     // Validate path
@@ -814,7 +833,7 @@ export class DiscordBot {
         .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
         .setDescription(
           `📁 **Path:** \`${projectPath}\`\n` +
-            `🤖 **Model:** ${model ?? this.config.codex.model}\n` +
+            `🤖 **Model:** ${formatModelSelection(project.model, this.config.codex.model)}\n` +
             `🔒 **Approval:** ${this.config.codex.approvalMode}\n\n` +
             `Create a thread in this channel to start a Codex conversation.`,
         )
@@ -907,7 +926,11 @@ export class DiscordBot {
       .addFields(
         { name: "Projects", value: `${projects.length}`, inline: true },
         { name: "Active Threads", value: `${activeThreads}`, inline: true },
-        { name: "Model", value: this.config.codex.model, inline: true },
+        {
+          name: "Model",
+          value: formatModelSelection(this.config.codex.model),
+          inline: true,
+        },
         { name: "Approval", value: this.config.codex.approvalMode, inline: true },
         { name: "Sandbox", value: this.config.codex.sandboxMode, inline: true },
       )
@@ -989,7 +1012,7 @@ export class DiscordBot {
         }
 
         const projectName = basename(canonicalProjectPath);
-        const model = sessions[0]?.model;
+        const model = discoveredSessionModelSelection(sessions[0]?.model);
 
         // Create channel
         const channel = await guild.channels.create({
@@ -1018,7 +1041,7 @@ export class DiscordBot {
           .setTitle(`${CATEGORY_PREFIX} Project: ${projectName}`)
           .setDescription(
             `📁 **Path:** \`${canonicalProjectPath}\`\n` +
-              `🤖 **Model:** ${model ?? this.config.codex.model}\n` +
+              `🤖 **Model:** ${formatModelSelection(projectRow.model, this.config.codex.model)}\n` +
               `📊 **Sessions found:** ${sessions.length}\n\n` +
               `Synced from local Codex sessions.`,
           )
@@ -1062,7 +1085,7 @@ export class DiscordBot {
               .setDescription(
                 `🔗 Codex session \`${session.id.slice(0, 12)}...\`\n` +
                   `📅 ${session.timestamp}\n` +
-                  `🤖 ${session.model ?? "default"}\n\n` +
+                  `🤖 ${formatModelSelection(session.model)}\n\n` +
                   `Use \`/sync-messages\` to replay this session's messages.`,
               )
               .setTimestamp();
@@ -1134,7 +1157,7 @@ export class DiscordBot {
         .slice(0, 15)
         .map(
           (s) =>
-            `\`${s.id}\` — ${getSessionDisplayName(s)} (${s.model ?? "default"})`,
+            `\`${s.id}\` — ${getSessionDisplayName(s)} (${formatModelSelection(s.model)})`,
         );
       await interaction.editReply(
         `❌ Session not found: \`${requestedSessionId}\`\n\n` +
@@ -1253,7 +1276,7 @@ export class DiscordBot {
         .setDescription(
           `🔗 Codex session \`${session.id.slice(0, 12)}...\`\n` +
             `📅 ${session.timestamp}\n` +
-            `🤖 ${session.model ?? "default"}\n` +
+            `🤖 ${formatModelSelection(session.model)}\n` +
             `📁 ${session.cwd}\n\n` +
             `Replaying history now. Live updates stay synced while the session is running.`,
         )
@@ -1381,7 +1404,7 @@ export class DiscordBot {
           .slice(0, 15)
           .map(
             (s) =>
-              `\`${s.id}\` — ${getSessionDisplayName(s)} (${s.model ?? "default"})`,
+              `\`${s.id}\` — ${getSessionDisplayName(s)} (${formatModelSelection(s.model)})`,
           );
         await interaction.editReply(
           `❌ Session \`${threadRow.codex_thread_id}\` not found on disk.\n\n` +
@@ -1402,7 +1425,7 @@ export class DiscordBot {
         .slice(0, 15)
         .map(
           (s) =>
-            `\`${s.id}\` — ${getSessionDisplayName(s)} (${s.model ?? "default"})`,
+            `\`${s.id}\` — ${getSessionDisplayName(s)} (${formatModelSelection(s.model)})`,
         );
       await interaction.editReply(
         `**Available sessions for ${project.project_name}:**\n${lines.join("\n")}\n\n` +

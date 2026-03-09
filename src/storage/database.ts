@@ -2,7 +2,11 @@ import initSqlJs, { type Database as SqlJsDatabase } from "sql.js";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { logger } from "../utils/logger.js";
-import { canonicalizeProjectPath } from "../utils/path.js";
+import {
+  canonicalizeProjectPath,
+  getProjectKey,
+  pickPreferredProjectPath,
+} from "../utils/path.js";
 
 let db: SqlJsDatabase;
 let dbPath: string;
@@ -49,6 +53,7 @@ function runMigrations(db: SqlJsDatabase): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       channel_id TEXT UNIQUE NOT NULL,
       project_path TEXT NOT NULL,
+      project_key TEXT,
       project_name TEXT NOT NULL,
       model TEXT,
       approval_mode TEXT,
@@ -77,45 +82,70 @@ function runMigrations(db: SqlJsDatabase): void {
     );
   `);
 
-  migrateCanonicalProjectPaths(db);
+  ensureProjectKeyColumn(db);
+  migrateProjectIdentities(db);
   dedupeCodexThreadMappings(db);
   createIndexes(db);
 }
 
-function migrateCanonicalProjectPaths(db: SqlJsDatabase): void {
-  const projects = queryRows<{ id: number; project_path: string }>(
+function ensureProjectKeyColumn(db: SqlJsDatabase): void {
+  const columns = queryRows<{ name: string }>(db, "PRAGMA table_info(projects)");
+  const hasProjectKey = columns.some((column) => column.name === "project_key");
+
+  if (!hasProjectKey) {
+    db.run("ALTER TABLE projects ADD COLUMN project_key TEXT");
+  }
+}
+
+function migrateProjectIdentities(db: SqlJsDatabase): void {
+  const projects = queryRows<{ id: number; project_path: string; project_key: string | null }>(
     db,
-    "SELECT id, project_path FROM projects ORDER BY id ASC",
+    "SELECT id, project_path, project_key FROM projects ORDER BY id ASC",
   );
 
-  const keepByCanonicalPath = new Map<string, number>();
+  const keepByProjectKey = new Map<string, { id: number; projectPath: string }>();
 
   for (const project of projects) {
     const canonicalPath = canonicalizeProjectPath(project.project_path);
-    const keepId = keepByCanonicalPath.get(canonicalPath);
+    const projectKey = getProjectKey(canonicalPath);
+    const existing = keepByProjectKey.get(projectKey);
 
-    if (!keepId) {
-      keepByCanonicalPath.set(canonicalPath, project.id);
+    if (!existing) {
+      keepByProjectKey.set(projectKey, {
+        id: project.id,
+        projectPath: canonicalPath,
+      });
 
-      if (project.project_path !== canonicalPath) {
-        db.run("UPDATE projects SET project_path = ? WHERE id = ?", [
+      if (project.project_path !== canonicalPath || project.project_key !== projectKey) {
+        db.run("UPDATE projects SET project_path = ?, project_key = ? WHERE id = ?", [
           canonicalPath,
+          projectKey,
           project.id,
         ]);
       }
       continue;
     }
 
+    const preferredPath = pickPreferredProjectPath(existing.projectPath, canonicalPath);
+    if (preferredPath !== existing.projectPath) {
+      db.run("UPDATE projects SET project_path = ?, project_key = ? WHERE id = ?", [
+        preferredPath,
+        projectKey,
+        existing.id,
+      ]);
+      existing.projectPath = preferredPath;
+    }
+
     db.run("UPDATE threads SET project_id = ? WHERE project_id = ?", [
-      keepId,
+      existing.id,
       project.id,
     ]);
     db.run("DELETE FROM projects WHERE id = ?", [project.id]);
 
     logger.warn("Merged duplicate project rows", {
-      keepProjectId: keepId,
+      keepProjectId: existing.id,
       mergedProjectId: project.id,
-      canonicalPath,
+      projectKey,
     });
   }
 }
@@ -155,6 +185,7 @@ function createIndexes(db: SqlJsDatabase): void {
   runIndex(db, "CREATE INDEX IF NOT EXISTS idx_threads_discord ON threads(discord_thread_id);");
   runIndex(db, "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);");
   runIndex(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_project_path_unique ON projects(project_path);");
+  runIndex(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_project_key_unique ON projects(project_key);");
   runIndex(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_codex_thread_unique ON threads(codex_thread_id);");
 }
 

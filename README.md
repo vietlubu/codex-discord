@@ -98,7 +98,7 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=39
 | `DISCORD_TOKEN` | ✅ | — | Discord bot token |
 | `DISCORD_GUILD_ID` | ✅ | — | Discord server ID |
 | `OPENAI_API_KEY` | ❌ | — | Not needed if logged in via Codex App |
-| `CODEX_MODEL` | ❌ | `o4-mini` | Default Codex model |
+| `CODEX_MODEL` | ❌ | `Codex default` | Optional model override. Leave unset/blank or set to `default` to use the model configured in Codex |
 | `CODEX_APPROVAL_MODE` | ❌ | `on-failure` | `never` \| `on-request` \| `on-failure` \| `untrusted` |
 | `CODEX_SANDBOX_MODE` | ❌ | `workspace-write` | `read-only` \| `workspace-write` \| `danger-full-access` |
 | `VERBOSE_LEVEL` | ❌ | `1` | `0` = quiet (final only), `1` = normal, `2` = detailed |

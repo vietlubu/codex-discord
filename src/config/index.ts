@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { parseConfiguredModel } from "../codex/model.js";
 
 /**
  * Verbosity level for Codex event output in Discord:
@@ -14,7 +15,7 @@ export interface Config {
     guildId: string;
   };
   codex: {
-    model: string;
+    model?: string;
     approvalMode: "never" | "on-request" | "on-failure" | "untrusted";
     sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
     verboseLevel: VerboseLevel;
@@ -46,7 +47,7 @@ export function loadConfig(): Config {
       guildId: requireEnv("DISCORD_GUILD_ID"),
     },
     codex: {
-      model: process.env.CODEX_MODEL ?? "o4-mini",
+      model: parseConfiguredModel(process.env.CODEX_MODEL),
       approvalMode:
         (process.env.CODEX_APPROVAL_MODE as Config["codex"]["approvalMode"]) ??
         "on-failure",

@@ -1,6 +1,7 @@
 import { Codex } from "@openai/codex-sdk";
 import type { Thread, RunStreamedResult, Input } from "@openai/codex-sdk";
 import type { Config } from "../config/index.js";
+import { formatModelSelection, resolveModelSelection } from "./model.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -16,7 +17,9 @@ export class CodexService {
   constructor(config: Config["codex"]) {
     this.config = config;
     this.codex = new Codex({});
-    logger.info("Codex service initialized", { model: config.model });
+    logger.info("Codex service initialized", {
+      model: formatModelSelection(config.model),
+    });
   }
 
   /**
@@ -27,18 +30,23 @@ export class CodexService {
     discordThreadId: string,
     workingDirectory: string,
     options?: {
-      model?: string;
+      model?: string | null;
       approvalMode?: string;
     },
   ): Thread {
+    const model = resolveModelSelection(options?.model, this.config.model);
     const thread = this.codex.startThread({
       workingDirectory,
       sandboxMode: this.config.sandboxMode as any,
       approvalPolicy: (options?.approvalMode ?? this.config.approvalMode) as any,
-      model: options?.model ?? this.config.model,
+      ...(model ? { model } : {}),
     });
     this.activeThreads.set(discordThreadId, thread);
-    logger.info("Codex thread created", { discordThreadId, workingDirectory });
+    logger.info("Codex thread created", {
+      discordThreadId,
+      workingDirectory,
+      model: formatModelSelection(options?.model, this.config.model),
+    });
     return thread;
   }
 
@@ -50,18 +58,23 @@ export class CodexService {
     codexThreadId: string,
     workingDirectory: string,
     options?: {
-      model?: string;
+      model?: string | null;
       approvalMode?: string;
     },
   ): Thread {
+    const model = resolveModelSelection(options?.model, this.config.model);
     const thread = this.codex.resumeThread(codexThreadId, {
       workingDirectory,
       sandboxMode: this.config.sandboxMode as any,
       approvalPolicy: (options?.approvalMode ?? this.config.approvalMode) as any,
-      model: options?.model ?? this.config.model,
+      ...(model ? { model } : {}),
     });
     this.activeThreads.set(discordThreadId, thread);
-    logger.info("Codex thread resumed", { discordThreadId, codexThreadId });
+    logger.info("Codex thread resumed", {
+      discordThreadId,
+      codexThreadId,
+      model: formatModelSelection(options?.model, this.config.model),
+    });
     return thread;
   }
 
@@ -72,7 +85,7 @@ export class CodexService {
     discordThreadId: string,
     codexThreadId: string | null,
     workingDirectory: string,
-    options?: { model?: string; approvalMode?: string },
+    options?: { model?: string | null; approvalMode?: string },
   ): Thread {
     // Check in-memory cache first
     const existing = this.activeThreads.get(discordThreadId);
