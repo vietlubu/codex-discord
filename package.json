@@ -21,9 +21,9 @@
   "dependencies": {
     "@openai/codex": "latest",
     "@openai/codex-sdk": "latest",
-    "sql.js": "^1.11.0",
     "discord.js": "^14.16.0",
     "dotenv": "^16.4.0",
+    "sql.js": "^1.11.0",
     "winston": "^3.14.0"
   },
   "devDependencies": {
